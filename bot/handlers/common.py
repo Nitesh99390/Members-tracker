@@ -23,19 +23,28 @@ HELP_ADMIN = """
 2. Open my private chat → /chats → select the chat.
 3. Configure with the inline panel (/panel).
 
+<b>How joins work</b>
+When someone joins, I DM the <b>owner</b> (or all admins) asking how long they may stay:
+1 week … 1 year, Lifetime, Custom, or Remove. No answer → the default duration is kept.
+Members joining through an /invite link get that link's preset duration automatically.
+
 <b>Chat management</b>
 /chats — choose which group/channel to manage
-/panel — settings panel (tracking, auto-kick, mode, notify, welcome, duration)
+/panel — settings panel (tracking, auto-remove, ask on join, join requests, …)
+/pending — joins waiting for your decision
 /stats — membership statistics
 /list [page] — active members sorted by expiry
 /expiring [7d] — who expires soon
+/search &lt;name|@user|id&gt; — find a member
 /logs — recent activity
 /permissions — check if I can ban users
 /forcecheck — run the expiry check now
+/sync — cross-check members with Telegram
 
 <b>Member management</b> (use ID, @username or reply)
 /add &lt;user&gt; [30d|2025-12-31|never] — start tracking manually
 /info &lt;user&gt; — details + quick action buttons
+/ask &lt;user&gt; — (re)send the duration prompt to the owner
 /extend &lt;user&gt; &lt;1m|15d|date&gt; — extend membership
 /setexpiry &lt;user&gt; &lt;date|duration|never&gt; — set exact expiry
 /remove &lt;user&gt; — remove immediately
@@ -44,6 +53,10 @@ HELP_ADMIN = """
 /unwhitelist &lt;user&gt;
 /note &lt;user&gt; &lt;text&gt; — attach a note (e.g. payment ref)
 /broadcast &lt;text&gt; — DM all active members
+
+<b>Invite links</b>
+/invite &lt;3m|1y|never&gt; [label] — link with a preset membership length
+/invites — list / revoke links
 
 <b>Chat settings</b>
 /setduration &lt;30d|1m|2w|never|global&gt;
@@ -96,13 +109,12 @@ async def cmd_help(message: Message, db: Database, settings: Settings) -> None:
 async def cmd_mystatus(message: Message, db: Database, settings: Settings) -> None:
     user_id = message.from_user.id
     now = datetime.now(timezone.utc)
-    chats = await db.list_chats()
     lines: list[str] = []
-    for chat in chats:
-        if message.chat.type != ChatType.PRIVATE and chat.chat_id != message.chat.id:
+    for member in await db.memberships_for_user(user_id):
+        if message.chat.type != ChatType.PRIVATE and member.chat_id != message.chat.id:
             continue
-        member = await db.get_member(chat.chat_id, user_id)
-        if not member or member.status != "active":
+        chat = await db.get_chat(member.chat_id)
+        if not chat:
             continue
         rem = "♾ permanent" if member.expires_at is None else humanize_delta(member.expires_at - now)
         lines.append(

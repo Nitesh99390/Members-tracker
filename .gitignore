@@ -7,3 +7,7 @@ __pycache__/
 *.log
 .venv/
 venv/
+data/*.db-wal
+data/*.db-shm
+data/backups/
+logs/

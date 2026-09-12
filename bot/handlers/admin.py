@@ -1,23 +1,39 @@
 """Admin commands (usable in groups or via private chat with a selected chat context)."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from html import escape
+from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import FSInputFile, Message
 
 from bot.config import Settings
 from bot.services.database import Chat, Database, Member
 from bot.services.membership import MembershipService
 from bot.services.scheduler import ExpiryScheduler
-from bot.utils.keyboards import chats_keyboard, member_keyboard, settings_keyboard
+from bot.utils.keyboards import (
+    chats_keyboard,
+    invites_keyboard,
+    join_prompt_keyboard,
+    member_keyboard,
+    pending_keyboard,
+    settings_keyboard,
+)
 from bot.utils.permissions import bot_can_restrict, is_admin
-from bot.utils.timeparse import ParseError, format_dt, humanize_delta, is_permanent, parse_duration
+from bot.utils.timeparse import (
+    ParseError,
+    describe_duration,
+    format_dt,
+    humanize_delta,
+    is_permanent,
+    parse_duration,
+)
 
 log = logging.getLogger(__name__)
 router = Router(name="admin")
@@ -89,9 +105,13 @@ async def ensure_member(
         await message.reply("⚠️ User is not tracked and not found in the chat.")
         return None
     member = await db.upsert_member(
-        chat.chat_id, user_id, cm.user.full_name, cm.user.username, None, message.from_user.id
+        chat.chat_id, user_id, cm.user.full_name, cm.user.username, None, message.from_user.id, source="manual"
     )
     return member
+
+
+def _panel_markup(chat: Chat, settings: Settings):
+    return settings_keyboard(chat, settings.default_duration, settings.ask_on_join_default)
 
 
 def _usage(message: Message, text: str):
@@ -116,9 +136,7 @@ async def cmd_chats(message: Message, bot: Bot, db: Database, settings: Settings
     if message.text and message.text.split()[0].lstrip("/").lower() in ("panel", "settings") and current:
         chat = await db.get_chat(current)
         if chat:
-            await message.answer(
-                panel_text(chat, settings), reply_markup=settings_keyboard(chat, settings.default_duration)
-            )
+            await message.answer(panel_text(chat, settings), reply_markup=_panel_markup(chat, settings))
             return
     await message.answer(
         "📂 <b>Select a chat to manage:</b>", reply_markup=chats_keyboard(chats, current)
@@ -131,19 +149,27 @@ async def cmd_panel_group(message: Message, bot: Bot, db: Database, settings: Se
     if not chat:
         return
     await db.set_context(message.from_user.id, chat.chat_id)
-    await message.reply(
-        panel_text(chat, settings), reply_markup=settings_keyboard(chat, settings.default_duration)
-    )
+    await message.reply(panel_text(chat, settings), reply_markup=_panel_markup(chat, settings))
 
 
 def panel_text(chat: Chat, settings: Settings) -> str:
-    icon = "📢" if chat.chat_type == "channel" else "👥"
+    icon = "📢" if chat.is_channel else "👥"
+    duration = chat.default_duration or settings.default_duration
+    ask = settings.ask_on_join_default if chat.ask_on_join is None else chat.ask_on_join
+    who = "owner" if chat.ask_target == "owner" else "all admins"
+    ask_line = (
+        f"🔔 On join: <b>ask {who}</b> how long the member may stay"
+        if ask
+        else "🔕 On join: <b>apply default silently</b>"
+    )
+    status = "" if chat.tracking_enabled else "\n⏸ <b>Tracking is paused</b>"
     return (
         f"{icon} <b>{escape(chat.display)}</b>\n"
-        f"🆔 <code>{chat.chat_id}</code>\n\n"
-        f"⏳ Default duration: <b>{chat.default_duration or settings.default_duration}</b>\n"
+        f"🆔 <code>{chat.chat_id}</code>{status}\n\n"
+        f"⏳ Default duration: <b>{escape(describe_duration(duration))}</b> (<code>{escape(duration)}</code>)\n"
+        f"{ask_line}\n"
         f"📨 Log chat: <code>{chat.log_chat_id or 'not set'}</code>\n\n"
-        f"Tap a button to toggle a setting."
+        f"Tap a button to change a setting."
     )
 
 
@@ -162,12 +188,14 @@ async def stats_text(db: Database, chat: Chat, settings: Settings) -> str:
     soon_24 = await db.expiring_within_count(chat.chat_id, now + timedelta(hours=24))
     soon_7d = await db.expiring_within_count(chat.chat_id, now + timedelta(days=7))
     wl = len(await db.list_whitelist(chat.chat_id))
+    pending = await db.count_pending(chat.chat_id)
     return (
         f"📊 <b>Stats — {escape(chat.display)}</b>\n\n"
-        f"🟢 Active: <b>{s.get('active', 0)}</b>\n"
+        f"🟢 Active: <b>{s.get('active', 0)}</b>  (joined today: {s.get('joined_today', 0)})\n"
         f"♾ Permanent: <b>{s.get('permanent', 0)}</b>\n"
         f"🛡 Whitelisted: <b>{wl}</b>\n"
-        f"⌛ Expired (removed): <b>{s.get('expired', 0)}</b>\n"
+        f"🔔 Awaiting decision: <b>{pending}</b>\n"
+        f"⌛ Expired (removed): <b>{s.get('expired', 0)}</b>  🚫 Removed manually: <b>{s.get('manual', 0)}</b>\n"
         f"⚪ Left: <b>{s.get('left', 0)}</b>  🔴 Kicked: <b>{s.get('kicked', 0)}</b>\n\n"
         f"⏰ Expiring in 24h: <b>{soon_24}</b>\n"
         f"📅 Expiring in 7 days: <b>{soon_7d}</b>\n\n"
@@ -222,7 +250,7 @@ async def cmd_expiring(
         await _usage(message, "/expiring [duration]  e.g. /expiring 3d")
         return
     before = datetime.now(timezone.utc) + timedelta(seconds=seconds + months * 30 * 86400)
-    members = [m for m in await db.expiring_members(before) if m.chat_id == chat.chat_id]
+    members = await db.expiring_members(before, chat_id=chat.chat_id)
     now = datetime.now(timezone.utc)
     if not members:
         await message.reply(f"✅ Nobody expires within {window}.")
@@ -283,18 +311,21 @@ async def cmd_add(
         return
     expiry_text = " ".join(rest).strip()
     try:
-        expires = service.parse_user_expiry(expiry_text) if expiry_text else service.compute_expiry(chat)
+        expires = service.expiry_from_text(expiry_text) if expiry_text else service.compute_expiry(chat)
     except ParseError as exc:
         await message.reply(f"⚠️ Invalid duration/date: {escape(str(exc))}")
         return
     try:
         cm = await bot.get_chat_member(chat.chat_id, uid)
         full_name, username = cm.user.full_name, cm.user.username
-    except TelegramBadRequest:
+    except (TelegramBadRequest, TelegramForbiddenError):
         full_name, username = None, None
     member = await db.upsert_member(
-        chat.chat_id, uid, full_name, username, expires, message.from_user.id
+        chat.chat_id, uid, full_name, username, expires, message.from_user.id, source="manual"
     )
+    pending = await db.get_pending_for(chat.chat_id, uid)
+    if pending:
+        await db.resolve_pending(pending.id, message.from_user.id, expiry_text or "default")
     await db.add_log(chat.chat_id, uid, "manual_add", str(expires), message.from_user.id)
     await message.reply(
         "✅ <b>Tracking started</b>\n\n" + service.member_card(chat, member),
@@ -330,12 +361,7 @@ async def cmd_extend(
     await message.reply(
         f"🔄 <b>Extended</b> {member.mention_html}\n⏳ New expiry: <b>{format_dt(new_expiry, settings.tz)}</b>"
     )
-    if chat.notify_user and new_expiry:
-        await service.dm_user(
-            uid,
-            f"🎉 Your membership in <b>{escape(chat.display)}</b> has been extended until "
-            f"<b>{format_dt(new_expiry, settings.tz)}</b>.",
-        )
+    await service.notify_extension(chat, uid, new_expiry)
 
 
 @router.message(Command("setexpiry", "set", "until"))
@@ -520,7 +546,9 @@ async def cmd_setduration(
             return
     await db.update_chat(chat.chat_id, default_duration=value)
     await db.add_log(chat.chat_id, None, "set_duration", value, message.from_user.id)
-    await message.reply(f"⏳ Default membership duration for new members: <b>{value}</b>")
+    await message.reply(
+        f"⏳ Default membership duration for new members: <b>{escape(describe_duration(value))}</b>"
+    )
 
 
 @router.message(Command("setlog", "logchat"))
@@ -578,9 +606,13 @@ async def cmd_forcecheck(
     if not chat:
         return
     result = await scheduler.run_once()
+    if result.get("skipped"):
+        await message.reply("⏳ A check is already running, try again in a moment.")
+        return
     await message.reply(
         f"🔁 Check complete.\nRemoved: <b>{result.get('removed', 0)}</b> • "
-        f"Reminded: <b>{result.get('reminded', 0)}</b>"
+        f"Reminded: <b>{result.get('reminded', 0)}</b> • "
+        f"Prompts timed out: <b>{result.get('prompts_expired', 0)}</b>"
     )
 
 
@@ -622,10 +654,14 @@ async def cmd_gstats(message: Message, db: Database, settings: Settings) -> None
     if message.from_user.id not in settings.super_admins:
         return
     s = await db.global_stats()
+    size_kb = db.db_size_bytes() / 1024
     await message.reply(
         f"🌐 <b>Global stats</b>\n\n"
-        f"Chats: <b>{s['chats']}</b>\nActive members: <b>{s['active']}</b>\n"
-        f"Expired: <b>{s['expired']}</b>\nTotal records: <b>{s['total']}</b>"
+        f"Chats: <b>{s['chats']}</b> (tracking: {s['tracking']})\n"
+        f"Active members: <b>{s['active']}</b>\n"
+        f"Expired: <b>{s['expired']}</b>\nTotal records: <b>{s['total']}</b>\n"
+        f"Pending decisions: <b>{s['pending']}</b>\nInvite links: <b>{s['invites']}</b>\n"
+        f"DB size: <b>{size_kb:.0f} KB</b>"
     )
 
 
@@ -643,13 +679,203 @@ async def cmd_broadcast(
         return
     members = await db.list_members(chat.chat_id, "active", limit=10000)
     sent = 0
-    import asyncio
-
     for m in members:
-        try:
-            await bot.send_message(m.user_id, f"📣 <b>{escape(chat.display)}</b>\n\n{text}")
+        if await service.safe_send(m.user_id, f"📣 <b>{escape(chat.display)}</b>\n\n{text}"):
             sent += 1
-        except Exception:  # noqa: BLE001
-            pass
         await asyncio.sleep(0.05)
+    await db.add_log(chat.chat_id, None, "broadcast", f"{sent}/{len(members)}", message.from_user.id)
     await message.reply(f"📣 Broadcast sent to <b>{sent}</b>/{len(members)} members.")
+
+
+# ------------------------------------------------------------- join prompts
+@router.message(Command("pending", "requests"))
+async def cmd_pending(
+    message: Message, bot: Bot, db: Database, settings: Settings, service: MembershipService
+) -> None:
+    """List joins that are waiting for an admin decision; re-send the prompt for each."""
+    chat = await resolve_chat(message, bot, db, settings)
+    if not chat:
+        return
+    from bot.handlers.callbacks import pending_text  # local import avoids a cycle
+
+    text, ids = await pending_text(db, chat, settings)
+    if message.chat.type != ChatType.PRIVATE:
+        await message.reply(text)
+        return
+    await message.answer(text, reply_markup=pending_keyboard(chat.chat_id, ids))
+
+
+@router.message(Command("ask"))
+async def cmd_ask(
+    message: Message,
+    command: CommandObject,
+    bot: Bot,
+    db: Database,
+    settings: Settings,
+    service: MembershipService,
+) -> None:
+    """/ask <user> — (re)send the duration prompt for a member to the owner/admins."""
+    chat = await resolve_chat(message, bot, db, settings)
+    if not chat:
+        return
+    uid, _ = await resolve_target(message, command, service, chat)
+    if uid is None:
+        await _usage(message, "/ask &lt;user&gt; — ask the owner how long this member may stay")
+        return
+    member = await ensure_member(message, db, chat, uid, bot)
+    if not member:
+        return
+    pending = await service.ask_owner_about_member(chat, member, source="manual")
+    if pending:
+        await message.reply("🔔 Prompt sent to the owner/admins.")
+    else:
+        await message.reply(
+            "⚠️ Nobody could be reached. The owner must /start me in private chat first.",
+            reply_markup=None,
+        )
+
+
+# ------------------------------------------------------------- invite links
+@router.message(Command("invite", "newlink"))
+async def cmd_invite(
+    message: Message,
+    command: CommandObject,
+    bot: Bot,
+    db: Database,
+    settings: Settings,
+    service: MembershipService,
+) -> None:
+    """/invite <duration|never> [name] — create an invite link with a preset membership length."""
+    chat = await resolve_chat(message, bot, db, settings)
+    if not chat:
+        return
+    args = (command.args or "").split(maxsplit=1)
+    if not args:
+        await _usage(message, "/invite &lt;1m | 3m | 1y | never&gt; [label]  e.g. <code>/invite 3m Gold plan</code>")
+        return
+    duration = args[0].lower()
+    name = args[1].strip() if len(args) > 1 else None
+    url, msg = await service.create_invite_link(chat, duration, name, message.from_user.id)
+    if not url:
+        await message.reply(f"❌ {escape(msg)}")
+        return
+    await message.reply(
+        f"🔗 <b>Invite link created</b>\n\n"
+        f"📛 {escape(msg)}\n⏳ Members joining via this link get: <b>{escape(describe_duration(duration))}</b>\n\n"
+        f"<code>{escape(url)}</code>"
+    )
+
+
+@router.message(Command("invites", "links"))
+async def cmd_invites(message: Message, bot: Bot, db: Database, settings: Settings) -> None:
+    chat = await resolve_chat(message, bot, db, settings)
+    if not chat:
+        return
+    from bot.handlers.callbacks import invites_text  # local import avoids a cycle
+
+    links = await db.list_invite_links(chat.chat_id)
+    if message.chat.type != ChatType.PRIVATE:
+        await message.reply(invites_text(chat, links))
+        return
+    await message.answer(invites_text(chat, links), reply_markup=invites_keyboard(chat, links))
+
+
+@router.message(Command("revoke"))
+async def cmd_revoke(
+    message: Message,
+    command: CommandObject,
+    bot: Bot,
+    db: Database,
+    settings: Settings,
+    service: MembershipService,
+) -> None:
+    chat = await resolve_chat(message, bot, db, settings)
+    if not chat:
+        return
+    arg = (command.args or "").strip()
+    if not arg:
+        await _usage(message, "/revoke &lt;invite link&gt;")
+        return
+    target = next(
+        (l for l in await db.list_invite_links(chat.chat_id) if l.invite_link.endswith(arg.split("/")[-1])),
+        None,
+    )
+    if not target:
+        await message.reply("⚠️ I don't know that link. Use /invites to see the ones I created.")
+        return
+    ok, msg = await service.revoke_invite_link(chat, target.invite_link, message.from_user.id)
+    await message.reply("🗑 Link revoked." if ok else f"⚠️ Marked revoked locally; Telegram said: {escape(msg)}")
+
+
+# --------------------------------------------------------------- utilities
+@router.message(Command("search", "find"))
+async def cmd_search(
+    message: Message, command: CommandObject, bot: Bot, db: Database, settings: Settings
+) -> None:
+    chat = await resolve_chat(message, bot, db, settings)
+    if not chat:
+        return
+    query = (command.args or "").strip()
+    if len(query) < 2:
+        await _usage(message, "/search &lt;name | @username | id&gt;")
+        return
+    found = await db.search_members(chat.chat_id, query, limit=15)
+    if not found:
+        await message.reply("🔍 No matches.")
+        return
+    now = datetime.now(timezone.utc)
+    lines = [f"🔍 <b>Search: {escape(query)}</b>", ""]
+    for m in found:
+        rem = "♾" if m.expires_at is None else humanize_delta(m.expires_at - now)
+        lines.append(f"• {m.mention_html} <code>{m.user_id}</code> — {m.status} — ⏳ {rem}")
+    await message.reply("\n".join(lines))
+
+
+@router.message(Command("sync"))
+async def cmd_sync(
+    message: Message, bot: Bot, db: Database, settings: Settings, service: MembershipService
+) -> None:
+    """Cross-check tracked members against Telegram (marks people who left)."""
+    chat = await resolve_chat(message, bot, db, settings)
+    if not chat:
+        return
+    total = await db.count_members(chat.chat_id, "active")
+    if total > 2000:
+        await message.reply("⚠️ Too many members to sync interactively (limit 2000).")
+        return
+    note = await message.reply(f"🔄 Syncing {total} members with Telegram…")
+    result = await service.sync_chat_members(chat)
+    await note.edit_text(
+        f"✅ <b>Sync complete</b>\nChecked: <b>{result['checked']}</b> • "
+        f"Left/removed: <b>{result['gone']}</b> • Errors: <b>{result['errors']}</b>"
+    )
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message, db: Database, settings: Settings) -> None:
+    """Super-admins: receive a copy of the database file."""
+    if message.from_user.id not in settings.super_admins:
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
+    dest = Path(settings.database_path).with_name(f"backup_{stamp}.db")
+    await db.backup_to(str(dest))
+    try:
+        await message.answer_document(
+            FSInputFile(str(dest)), caption=f"🗄 Database backup {stamp} UTC ({dest.stat().st_size // 1024} KB)"
+        )
+    finally:
+        dest.unlink(missing_ok=True)
+
+
+@router.message(Command("health"))
+async def cmd_health(message: Message, db: Database, settings: Settings, scheduler: ExpiryScheduler) -> None:
+    if message.from_user.id not in settings.super_admins:
+        return
+    ok = await db.healthcheck()
+    last = await db.kv_get("last_check")
+    last_txt = format_dt(datetime.fromisoformat(last), settings.tz) if last else "never"
+    await message.reply(
+        f"🩺 <b>Health</b>\nDatabase: {'✅' if ok else '❌'}\n"
+        f"Scheduler: {'✅ running' if scheduler.scheduler.running else '❌ stopped'}\n"
+        f"Last expiry check: {last_txt}\nCheck interval: {settings.check_interval}s"
+    )

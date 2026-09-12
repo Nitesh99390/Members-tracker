@@ -191,3 +191,38 @@ def format_dt(dt: datetime | None, tz: ZoneInfo) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(tz).strftime("%d %b %Y, %H:%M")
+
+
+def describe_duration(text: str) -> str:
+    """Return a human label for a duration string, e.g. ``"1m"`` -> ``"1 month"``.
+
+    Falls back to the raw text when it cannot be parsed.
+    """
+    if is_permanent(text):
+        return "Lifetime (never expires)"
+    try:
+        months, seconds = parse_duration(text)
+    except ParseError:
+        return text
+    parts: list[str] = []
+    if months:
+        years, rem_months = divmod(months, 12)
+        if years:
+            parts.append(f"{years} year" + ("s" if years != 1 else ""))
+        if rem_months:
+            parts.append(f"{rem_months} month" + ("s" if rem_months != 1 else ""))
+    if seconds:
+        days, rem = divmod(seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes = rem // 60
+        if days and days % 7 == 0 and not hours and not minutes:
+            weeks = days // 7
+            parts.append(f"{weeks} week" + ("s" if weeks != 1 else ""))
+        else:
+            if days:
+                parts.append(f"{days} day" + ("s" if days != 1 else ""))
+            if hours:
+                parts.append(f"{hours} hour" + ("s" if hours != 1 else ""))
+            if minutes:
+                parts.append(f"{minutes} min")
+    return " ".join(parts) or text
