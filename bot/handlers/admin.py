@@ -20,7 +20,6 @@ from bot.services.scheduler import ExpiryScheduler
 from bot.utils.keyboards import (
     chats_keyboard,
     invites_keyboard,
-    join_prompt_keyboard,
     member_keyboard,
     pending_keyboard,
     settings_keyboard,
@@ -667,7 +666,12 @@ async def cmd_gstats(message: Message, db: Database, settings: Settings) -> None
 
 @router.message(Command("broadcast"))
 async def cmd_broadcast(
-    message: Message, command: CommandObject, bot: Bot, db: Database, settings: Settings
+    message: Message,
+    command: CommandObject,
+    bot: Bot,
+    db: Database,
+    settings: Settings,
+    service: MembershipService,
 ) -> None:
     """Send a DM to all active tracked members of the selected chat (admins only)."""
     chat = await resolve_chat(message, bot, db, settings)

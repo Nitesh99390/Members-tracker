@@ -18,7 +18,6 @@ from bot.handlers.admin import list_text, logs_text, panel_text, stats_text
 from bot.services.database import Chat, Database
 from bot.services.membership import MembershipService
 from bot.utils.keyboards import (
-    back_keyboard,
     cancel_keyboard,
     confirm_keyboard,
     duration_keyboard,
