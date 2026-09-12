@@ -335,7 +335,7 @@ class MembershipService:
         )
         if chat.notify_user and member.status == "active":
             if new_expiry is None:
-                body = f"has <b>lifetime</b> access 🎉"
+                body = "has <b>lifetime</b> access 🎉"
             else:
                 body = f"is valid until <b>{format_dt(new_expiry, self.settings.tz)}</b>"
             await self.dm_user(
