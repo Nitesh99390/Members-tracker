@@ -80,3 +80,18 @@ def test_humanize_delta():
     assert humanize_delta(timedelta(hours=2, minutes=30)) == "2h 30m"
     assert humanize_delta(timedelta(seconds=-5)) == "expired"
     assert humanize_delta(timedelta(seconds=10)) == "<1m"
+
+
+def test_describe_duration():
+    from bot.utils.timeparse import describe_duration
+
+    assert describe_duration("1m") == "1 month"
+    assert describe_duration("3m") == "3 months"
+    assert describe_duration("1y") == "1 year"
+    assert describe_duration("14m") == "1 year 2 months"
+    assert describe_duration("2w") == "2 weeks"
+    assert describe_duration("30d") == "30 days"
+    assert describe_duration("1m 15d") == "1 month 15 days"
+    assert describe_duration("12h") == "12 hours"
+    assert describe_duration("never").startswith("Lifetime")
+    assert describe_duration("garbage") == "garbage"
