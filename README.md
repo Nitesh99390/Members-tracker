@@ -1,4 +1,4 @@
-# 🤖 Telegram Member Tracker Bot
+# 🤖 Telegram Member Tracker Bot `v1`
 
 Professional membership-management bot for Telegram **groups and channels**.
 It tracks every member from the moment they join, and automatically removes them after
@@ -142,12 +142,19 @@ The bot is designed so that an owner almost never types a command:
 
 | Screen | What you see |
 |--------|--------------|
+| **Bottom menu** (persistent) | `📊 Dashboard` `👥 Members` · `🔔 Pending` `🔗 Invite links` · `⚙️ Settings` `📂 My chats` · `📖 Help` |
 | **Home** (`/start`) | `📂 My chats` · `➕ Add to group` · `📖 Help` |
 | **Dashboard** | `👥 Members` `📊 Overview` · `🔔 Pending (n)` `🔗 Invite links` · `⚙️ Settings` `📜 Activity` |
 | **Settings** | Duration · Tracking · Auto-remove · Ask on join · Kick/Ban · `🔧 Advanced` |
 | **Join prompt** (DM) | `✅ Keep · 1 month` · three quick picks · `⋯ More options` / `🚫 Remove` |
 | **Member card** | `+1 month` `+3 months` `♾ Lifetime` · `✏️ Custom` `⋯ More` |
 | **Help** | Short topic pages instead of a command wall |
+
+The **bottom menu** is a Telegram reply keyboard installed on `/start` (and refreshed the moment your first
+chat gets tracked). It adapts to the user: regular users see `📇 My memberships · 📖 Help`, admins without
+a chat see `➕ Add to group · 📖 Help`, admins with chats get the full menu. Every tap opens the same screen
+as the matching inline button and cancels any pending text input, so you can never get "stuck" in a flow.
+With one tracked chat it is auto-selected; with several, `📂 My chats` / a chat picker appears.
 
 Typing a **user ID or @username** in the private chat opens that member's card directly.
 The Telegram "/" menu only lists `start`, `chats`, `pending`, `help` (and reply-shortcuts in groups).
@@ -198,6 +205,7 @@ bot/
   web.py                     # aiohttp side-car: /healthz /readyz /metrics + webhook receiver
   handlers/
     common.py                # /start /help /mystatus /id
+    menu.py                  # persistent bottom-menu (reply keyboard) taps
     admin.py                 # admin commands
     callbacks.py             # inline button handlers
     tracking.py              # join/leave/bot-added/join-request/invite-link events
@@ -208,11 +216,11 @@ bot/
     metrics.py               # counters / gauges / latency + Prometheus exposition
   utils/
     timeparse.py             # durations & dates parsing
-    keyboards.py             # inline keyboards
+    keyboards.py             # inline keyboards + bottom reply menu
     permissions.py           # admin checks
     cache.py                 # TTL + LRU cache for hot read paths
     telegram.py              # tg_call / tg_try: retries for flood limits & network blips
-tests/                       # pytest suite (64 tests)
+tests/                       # pytest suite (78 tests)
 ```
 
 Run tests: `python -m pytest -q`

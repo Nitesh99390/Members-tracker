@@ -12,6 +12,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import FSInputFile, Message
 
+from bot import VERSION_TAG, __version__
 from bot.config import Settings
 from bot.services.database import Chat, Database, Member
 from bot.services.membership import MembershipService
@@ -939,7 +940,7 @@ async def cmd_health(
     last = await db.kv_get("last_check")
     last_txt = format_dt(datetime.fromisoformat(last), settings.tz) if last else "never"
     lines = [
-        "🩺 <b>Health</b>",
+        f"🩺 <b>Health</b> · <code>{VERSION_TAG}</code> ({__version__})",
         f"Database: {'✅' if ok else '❌'} · {db.db_size_bytes() / 1024:.0f} KB",
         f"Scheduler: {'✅ running' if scheduler.running else '❌ stopped'} · every {settings.check_interval}s",
         f"Last expiry check: {last_txt} ({scheduler.last_run_duration * 1000:.0f} ms)",

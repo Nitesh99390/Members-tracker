@@ -19,7 +19,7 @@ from aiogram.exceptions import (
     TelegramNetworkError,
     TelegramRetryAfter,
 )
-from aiogram.types import InlineKeyboardMarkup, User
+from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, User
 
 from bot.config import Settings
 from bot.services.database import Chat, Database, Member, PendingJoin
@@ -37,6 +37,9 @@ from bot.utils.timeparse import (
 )
 
 log = logging.getLogger(__name__)
+
+#: Anything ``send_message`` accepts as ``reply_markup`` (inline or bottom keyboard).
+ReplyMarkup = InlineKeyboardMarkup | ReplyKeyboardMarkup | ReplyKeyboardRemove
 
 
 class MembershipService:
@@ -85,7 +88,7 @@ class MembershipService:
         self,
         chat_id: int,
         text: str,
-        reply_markup: InlineKeyboardMarkup | None = None,
+        reply_markup: ReplyMarkup | None = None,
         retries: int = 2,
         **kwargs: Any,
     ) -> Any | None:
@@ -122,7 +125,7 @@ class MembershipService:
             return
         await self.safe_send(chat.log_chat_id, text)
 
-    async def dm_user(self, user_id: int, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> bool:
+    async def dm_user(self, user_id: int, text: str, reply_markup: ReplyMarkup | None = None) -> bool:
         return await self.safe_send(user_id, text, reply_markup=reply_markup) is not None
 
     async def get_owner_id(self, chat: Chat, refresh: bool = False) -> int | None:

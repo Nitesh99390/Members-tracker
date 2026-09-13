@@ -12,7 +12,12 @@ from aiogram.types import ChatJoinRequest, ChatMemberUpdated, Message
 from bot.config import Settings
 from bot.services.database import Database
 from bot.services.membership import MembershipService
-from bot.utils.keyboards import dashboard_keyboard, join_prompt_keyboard, open_private_keyboard
+from bot.utils.keyboards import (
+    dashboard_keyboard,
+    join_prompt_keyboard,
+    main_menu_keyboard,
+    open_private_keyboard,
+)
 from bot.utils.permissions import refresh_chat_admins
 from bot.utils.timeparse import describe_duration, format_dt
 
@@ -69,16 +74,18 @@ async def on_bot_membership(
     pending = await db.count_pending(chat.id)
     dm_markup = dashboard_keyboard(record, pending)
 
-    # Notify the admin who added the bot privately (works for channels too)
+    # Notify the admin who added the bot privately (works for channels too).
+    # Their bottom menu may still be the "no chats yet" variant from /start, so the
+    # first DM carries the full admin menu; the dashboard follows as a second message
+    # (Telegram allows only one keyboard per message).
     notified: set[int] = set()
-    if actor_id:
-        await db.set_context(actor_id, chat.id)
-        if await service.dm_user(actor_id, text, reply_markup=dm_markup):
-            notified.add(actor_id)
-    if owner_id and owner_id not in notified:
-        await db.set_context(owner_id, chat.id)
-        if await service.dm_user(owner_id, text, reply_markup=dm_markup):
-            notified.add(owner_id)
+    for uid in (actor_id, owner_id):
+        if not uid or uid in notified:
+            continue
+        await db.set_context(uid, chat.id)
+        if await service.dm_user(uid, text, reply_markup=main_menu_keyboard(True, True)):
+            notified.add(uid)
+            await service.dm_user(uid, "⚡ <b>Quick actions</b>", reply_markup=dm_markup)
     if not notified and chat.type != ChatType.CHANNEL:
         # nobody reachable in private → post once in the group with a button to the DM
         me = await bot.me()
