@@ -59,6 +59,17 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on", "y"}
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("%s=%r is not a number, using default %s", name, raw, default)
+        return default
+
+
 def _env_optional_int(name: str) -> int | None:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -91,6 +102,21 @@ class Settings:
     # --- protection ----------------------------------------------------------
     throttle_rate: float = 0.5  # min seconds between actions per user
     throttle_burst: int = 5  # actions allowed in a burst before throttling
+    # --- runtime / ops ---------------------------------------------------------
+    http_host: str = "0.0.0.0"
+    http_port: int | None = None  # enable /healthz + /metrics side-car
+    webhook_url: str | None = None  # public base URL → switch from polling to webhook
+    webhook_path: str = "/webhook"
+    webhook_secret: str = ""
+    log_json: bool = False
+    drop_pending_updates: bool = False
+    cache_ttl: float = 120.0
+
+    @property
+    def webhook_full_url(self) -> str | None:
+        if not self.webhook_url:
+            return None
+        return self.webhook_url.rstrip("/") + self.webhook_path
 
     @property
     def tz(self) -> ZoneInfo:
@@ -136,6 +162,23 @@ class Settings:
         if level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
             level = "INFO"
 
+        webhook_url = os.getenv("WEBHOOK_URL", "").strip() or None
+        if webhook_url and not webhook_url.startswith("https://"):
+            log.warning("WEBHOOK_URL must be https:// — falling back to long polling")
+            webhook_url = None
+        webhook_path = os.getenv("WEBHOOK_PATH", "/webhook").strip() or "/webhook"
+        if not webhook_path.startswith("/"):
+            webhook_path = "/" + webhook_path
+        webhook_secret = re.sub(r"[^A-Za-z0-9_-]", "", os.getenv("WEBHOOK_SECRET", ""))[:256]
+        http_port = _env_optional_int("HTTP_PORT")
+        if webhook_url and http_port is None:
+            http_port = 8080
+            log.info("WEBHOOK_URL set without HTTP_PORT — listening on %s", http_port)
+        try:
+            cache_ttl = max(0.0, float(os.getenv("CACHE_TTL", "120") or 120))
+        except ValueError:
+            cache_ttl = 120.0
+
         return cls(
             bot_token=token,
             super_admins=_parse_int_list(os.getenv("SUPER_ADMINS", "")),
@@ -154,6 +197,14 @@ class Settings:
             backup_chat_id=_env_optional_int("BACKUP_CHAT_ID"),
             backup_hour_utc=_env_int("BACKUP_HOUR_UTC", 3, minimum=0, maximum=23),
             notify_admins_on_error=_env_bool("NOTIFY_ADMINS_ON_ERROR", True),
-            throttle_rate=max(0.1, float(os.getenv("THROTTLE_RATE", "0.5") or 0.5)),
+            throttle_rate=max(0.1, _env_float("THROTTLE_RATE", 0.5)),
             throttle_burst=_env_int("THROTTLE_BURST", 5, minimum=1, maximum=50),
+            http_host=os.getenv("HTTP_HOST", "0.0.0.0").strip() or "0.0.0.0",
+            http_port=http_port,
+            webhook_url=webhook_url,
+            webhook_path=webhook_path,
+            webhook_secret=webhook_secret,
+            log_json=_env_bool("LOG_JSON", False),
+            drop_pending_updates=_env_bool("DROP_PENDING_UPDATES", False),
+            cache_ttl=cache_ttl,
         )

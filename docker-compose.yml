@@ -4,5 +4,10 @@ services:
     container_name: member-tracker-bot
     restart: unless-stopped
     env_file: .env
+    stop_grace_period: 25s
     volumes:
       - ./data:/app/data
+      - ./logs:/app/logs
+    # Uncomment to expose /healthz, /readyz, /metrics (set HTTP_PORT=8080 in .env)
+    # ports:
+    #   - "8080:8080"

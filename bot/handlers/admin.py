@@ -1,7 +1,6 @@
 """Admin commands (usable in groups or via private chat with a selected chat context)."""
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -16,6 +15,7 @@ from aiogram.types import FSInputFile, Message
 from bot.config import Settings
 from bot.services.database import Chat, Database, Member
 from bot.services.membership import MembershipService
+from bot.services.metrics import Metrics
 from bot.services.scheduler import ExpiryScheduler
 from bot.utils.keyboards import (
     chats_keyboard,
@@ -728,14 +728,20 @@ async def cmd_broadcast(
     if not text:
         await _usage(message, "/broadcast &lt;message&gt; — DM all active members of this chat")
         return
-    members = await db.list_members(chat.chat_id, "active", limit=10000)
-    sent = 0
-    for m in members:
-        if await service.safe_send(m.user_id, f"📣 <b>{escape(chat.display)}</b>\n\n{text}"):
-            sent += 1
-        await asyncio.sleep(0.05)
-    await db.add_log(chat.chat_id, None, "broadcast", f"{sent}/{len(members)}", message.from_user.id)
-    await message.reply(f"📣 Broadcast sent to <b>{sent}</b>/{len(members)} members.")
+    total = await db.count_members(chat.chat_id, "active")
+    note = await message.reply(f"📣 Broadcasting to {total} members…")
+
+    async def progress(done: int, total_: int) -> None:
+        try:
+            await note.edit_text(f"📣 Broadcasting… <b>{done}</b>/{total_}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    sent, total = await service.broadcast(chat, text, message.from_user.id, progress=progress)
+    try:
+        await note.edit_text(f"📣 Broadcast delivered to <b>{sent}</b>/{total} members.")
+    except Exception:  # noqa: BLE001
+        await message.reply(f"📣 Broadcast delivered to <b>{sent}</b>/{total} members.")
 
 
 # ------------------------------------------------------------- join prompts
@@ -924,14 +930,36 @@ async def cmd_backup(message: Message, db: Database, settings: Settings) -> None
 
 
 @router.message(Command("health"))
-async def cmd_health(message: Message, db: Database, settings: Settings, scheduler: ExpiryScheduler) -> None:
+async def cmd_health(
+    message: Message, db: Database, settings: Settings, scheduler: ExpiryScheduler, metrics: Metrics | None = None
+) -> None:
     if message.from_user.id not in settings.super_admins:
         return
     ok = await db.healthcheck()
     last = await db.kv_get("last_check")
     last_txt = format_dt(datetime.fromisoformat(last), settings.tz) if last else "never"
-    await message.reply(
-        f"🩺 <b>Health</b>\nDatabase: {'✅' if ok else '❌'}\n"
-        f"Scheduler: {'✅ running' if scheduler.scheduler.running else '❌ stopped'}\n"
-        f"Last expiry check: {last_txt}\nCheck interval: {settings.check_interval}s"
-    )
+    lines = [
+        "🩺 <b>Health</b>",
+        f"Database: {'✅' if ok else '❌'} · {db.db_size_bytes() / 1024:.0f} KB",
+        f"Scheduler: {'✅ running' if scheduler.running else '❌ stopped'} · every {settings.check_interval}s",
+        f"Last expiry check: {last_txt} ({scheduler.last_run_duration * 1000:.0f} ms)",
+        f"Mode: {'webhook' if settings.webhook_url else 'polling'}"
+        + (f" · HTTP :{settings.http_port}" if settings.http_port else ""),
+    ]
+    if metrics is not None:
+        snap = metrics.snapshot()
+        c = snap["counters"]
+        lat = snap["latency"].get("handler_latency", {})
+        cache = db.cache_stats()
+        lines += [
+            "",
+            f"⏱ Uptime: <b>{humanize_delta(timedelta(seconds=snap['uptime_seconds']))}</b>",
+            f"📨 Updates: <b>{c.get('updates_total', 0)}</b> · errors: {c.get('errors_total', 0)} · throttled: {c.get('throttled_total', 0)}",
+            f"⚡ Handler latency: avg {lat.get('mean_ms', 0)} ms · max {lat.get('max_ms', 0)} ms",
+            f"🗄 Cache hit-rate: chats {cache['chats']['hit_ratio']:.0%} · admins {cache['admins']['hit_ratio']:.0%}"
+            f" · queries {cache['queries']} · writes {cache['writes']}",
+            f"🔁 Removed: {c.get('members_removed', 0)} · reminders: {c.get('reminders_sent', 0)} · ticks: {c.get('scheduler_ticks', 0)}",
+        ]
+        if snap["last_error"]:
+            lines.append(f"🐞 Last error: <code>{escape(snap['last_error'])}</code>")
+    await message.reply("\n".join(lines))
