@@ -32,6 +32,9 @@ Built with Python 3.11+, [aiogram 3](https://docs.aiogram.dev/), SQLite and APSc
 | **Broadcast** | DM all active members of a chat. |
 | **Notes** | Attach notes to members (e.g. payment reference). |
 | **Search & sync** | `/search` by name/username/ID; `/sync` cross-checks stored members against Telegram. |
+| **CSV export** | *Tools → 📥 Export CSV* (or `/export [active\|soon\|lifetime\|past]`) sends an Excel/Sheets-friendly spreadsheet: ID, name, username, status, join & expiry dates, remaining time, source, renewals, notes. |
+| **Grace period** | Optional per-chat delay (`off · 12h · 1d · 3d` or `/setgrace 36h`) between expiry and removal, so late payers get a buffer. |
+| **Daily digest** | Opt-in per chat: one DM per day (at `DIGEST_HOUR` local time) to the owner/admins listing members expiring within 3 days. |
 | **Maintenance** | Daily log pruning + SQLite backup (optionally sent to a chat), `/backup` and `/health` for super-admins, rotating log files. |
 | **Protection** | Per-user anti-spam throttling for commands/buttons; unhandled errors are DM'd to super-admins. |
 | **Robust** | Rate-limit aware, retries failed removals with backoff, permission checks, admin-cache refresh, WAL SQLite, schema auto-migration. |
@@ -84,6 +87,7 @@ pm2 logs member-tracker-bot --nostream
 | `BACKUP_CHAT_ID` | – | Optional chat/user ID that receives the daily DB backup |
 | `BACKUP_HOUR_UTC` | `3` | Hour (UTC) for daily maintenance (log pruning + backup) |
 | `NOTIFY_ADMINS_ON_ERROR` | `true` | DM super-admins on unhandled errors |
+| `DIGEST_HOUR` | `9` | Local hour (in `TIMEZONE`) when opted-in chats receive the daily "expiring soon" digest |
 | `THROTTLE_RATE` / `THROTTLE_BURST` | `0.5` / `5` | Anti-spam: allow `BURST` actions, then min `RATE` seconds between actions |
 | `HTTP_PORT` / `HTTP_HOST` | – / `0.0.0.0` | Enable the HTTP side-car (`/healthz`, `/readyz`, `/metrics`). Empty = disabled |
 | `WEBHOOK_URL` | – | Public `https://` base URL → switch from polling to webhook mode (implies `HTTP_PORT=8080`) |
@@ -149,9 +153,10 @@ The bot is designed so that an owner almost never types a command:
 | **My chats** | One row per chat with live badges: `▸ 👥 VIP Club · 120 · 🔔3` (active members · pending prompts) |
 | **Dashboard** | `👥 Members` `⏰ Expiring · n` · `🔔 Pending · n` `🔗 Invite links` · `📊 Overview` `📜 Activity` · `⚙️ Settings` `🛠 Tools` |
 | **Members** | Tabs `▸ 🟢 Active 30` `⏰ Expiring 2` `♾ Lifetime 1` `📁 Past 7` · tappable rows · `◀️ 2 / 4 ▶️` pager · `🔍 Search` `➕ Add member` |
-| **Tools** | `➕ Add member` `🔍 Search` · `📣 Broadcast` (with preview + confirm + progress bar) `🛡 VIP list` · `🔄 Sync` `🔁 Run expiry check` · `🔐 Check permissions` |
+| **Tools** | `➕ Add member` `🔍 Search` · `📣 Broadcast` (with preview + confirm + progress bar) `🛡 VIP list` · `🔄 Sync` `🔁 Run expiry check` · `📥 Export CSV` `🔐 Check permissions` |
+| **Export CSV** | `📥 Everyone · n` · `🟢 Active · n` `⏰ Expiring · n` · `♾ Lifetime · n` `📁 Past · n` — one tap sends the spreadsheet file |
 | **Settings** | Duration (current preset marked `✓`, `✏️ Custom`) · Tracking · Auto-remove · Ask on join · Kick/Ban · `🔧 Advanced` |
-| **Advanced** | Member DMs · Welcome on/off · Join requests (ignore / auto / ask) · Prompts → owner/admins · `✏️ Welcome text` `📨 Log channel` editors |
+| **Advanced** | Member DMs · Welcome on/off · Join requests (ignore / auto / ask) · Prompts → owner/admins · `⏱ Grace · off/12h/1d/3d` `✅ Daily digest` · `✏️ Welcome text` `📨 Log channel` editors |
 | **Pending** | One row per waiting member (`🙋` request / `👤` join) · `✅ Default for all (n)` bulk action with confirmation |
 | **Join prompt** (DM) | `✅ Keep · 1 month` · three quick picks · `⋯ More options` / `🚫 Remove` |
 | **Member card** | `+1 week` `+1 month` `+3 months` · `♾ Lifetime` `✏️ Custom` `⋯ More` · `◀️ Members` (same tab/page) |
@@ -181,6 +186,8 @@ All commands still work; they are simply not advertised in the menu.
 | `/stats` · `/list [active\|soon\|lifetime\|past] [page]` · `/expiring [7d]` · `/logs` | Reports (in private chat these open the tappable screens) |
 | `/search <name\|@user\|id>` | Find a member |
 | `/permissions` · `/forcecheck` · `/sync` | Diagnostics |
+| `/export [all\|active\|soon\|lifetime\|past]` (`/csv`) | Send the member list as a CSV file |
+| `/setgrace <24\|12h\|3d\|off>` (`/grace`) | Grace period between expiry and removal (max 30 days) |
 | `/setduration <30d\|1m\|never\|global>` | Default duration for this chat |
 | `/setlog <chat_id\|here\|off>` · `/setwelcome <text>` | Log destination / welcome template |
 
@@ -223,7 +230,8 @@ bot/
   services/
     database.py              # aiosqlite persistence layer
     membership.py            # business logic (track, remove, extend, cards)
-    scheduler.py             # APScheduler jobs: expiry, reminders, prompt timeouts, housekeeping, maintenance
+    export.py                # CSV rendering for /export and the Tools → Export screen
+    scheduler.py             # APScheduler jobs: expiry, reminders, prompt timeouts, daily digest, housekeeping, maintenance
     metrics.py               # counters / gauges / latency + Prometheus exposition
   utils/
     timeparse.py             # durations & dates parsing
@@ -232,7 +240,7 @@ bot/
     permissions.py           # admin checks
     cache.py                 # TTL + LRU cache for hot read paths
     telegram.py              # tg_call / tg_try: retries for flood limits & network blips
-tests/                       # pytest suite (100 tests)
+tests/                       # pytest suite (113 tests)
 ```
 
 Run tests: `python -m pytest -q`

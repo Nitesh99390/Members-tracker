@@ -17,7 +17,12 @@ from aiogram.types import Message
 from bot import VERSION_TAG
 from bot.config import Settings
 from bot.services.database import Database
-from bot.utils.keyboards import help_keyboard, home_keyboard, main_menu_keyboard, open_private_keyboard
+from bot.utils.keyboards import (
+    help_keyboard,
+    home_keyboard,
+    main_menu_keyboard,
+    open_private_keyboard,
+)
 from bot.utils.timeparse import format_dt, humanize_delta
 
 router = Router(name="common")
@@ -64,7 +69,8 @@ HELP_TOPICS: dict[str, str] = {
         "• <b>Ask on join</b> — prompt you for each new member.\n"
         "• <b>Kick / Ban mode</b> — kicked users can rejoin, banned cannot.\n\n"
         "<b>Advanced</b>: DM members about expiry, welcome message, join-request handling, "
-        "who receives prompts (owner or all admins)."
+        "who receives prompts (owner or all admins), a <b>grace period</b> after expiry before "
+        "removal, and a <b>daily digest</b> DM listing members expiring within 3 days."
     ),
     "commands": (
         "<b>⌨️ Commands &amp; formats</b>\n\n"
@@ -74,7 +80,8 @@ HELP_TOPICS: dict[str, str] = {
         "<code>/remove &lt;user&gt;</code> · <code>/whitelist &lt;user&gt;</code> · <code>/note &lt;user&gt; text</code>\n"
         "<code>/invite 3m Gold</code> · <code>/expiring 3d</code> · <code>/search name</code>\n"
         "<code>/setwelcome text</code> · <code>/setlog here</code> · <code>/broadcast text</code>\n"
-        "<code>/sync</code> · <code>/forcecheck</code> · <code>/permissions</code>\n\n"
+        "<code>/sync</code> · <code>/forcecheck</code> · <code>/permissions</code>\n"
+        "<code>/export [active|soon|past]</code> — CSV spreadsheet · <code>/setgrace 24h</code>\n\n"
         "<b>Durations</b>: <code>30d</code> <code>2w</code> <code>1m</code> <code>1y</code> <code>1m 15d</code> <code>never</code>\n"
         "<b>Dates</b>: <code>2025-12-31</code> · <code>31/12/2025 18:30</code>\n\n"
         "<i>Tip: the bottom menu is always one tap away — use it to jump to any screen.</i>"

@@ -49,6 +49,9 @@ MEMBER_VIEWS: tuple[tuple[str, str, str], ...] = (
     ("past", "Past", "📁"),
 )
 
+#: Grace-period steps (hours) the ⏱ Grace button cycles through in Advanced.
+GRACE_STEPS: tuple[int, ...] = (0, 12, 24, 72)
+
 #: Telegram caps button labels at 64 chars; keep names short so counters fit.
 BTN_NAME = 26
 
@@ -67,6 +70,25 @@ def _copy(text: str, payload: str) -> InlineKeyboardButton:
 
 def onoff(flag: bool) -> str:
     return "✅" if flag else "❌"
+
+
+def grace_label(hours: int) -> str:
+    """``off`` · ``12h`` · ``3d`` — compact label for the grace-period switch."""
+    if hours <= 0:
+        return "off"
+    if hours % 24 == 0:
+        days = hours // 24
+        return f"{days}d"
+    return f"{hours}h"
+
+
+def next_grace(current: int) -> int:
+    """Next value in :data:`GRACE_STEPS`; custom values jump back to the first step."""
+    try:
+        idx = GRACE_STEPS.index(current)
+    except ValueError:
+        return GRACE_STEPS[0]
+    return GRACE_STEPS[(idx + 1) % len(GRACE_STEPS)]
 
 
 def preset_label(value: str) -> str:
@@ -249,8 +271,23 @@ def tools_keyboard(chat: Chat) -> InlineKeyboardMarkup:
     kb.row(_btn("➕ Add member", f"addm:{cid}"), _btn("🔍 Search", f"search:{cid}"))
     kb.row(_btn("📣 Broadcast", f"bcast:{cid}"), _btn("🛡 VIP list", f"vips:{cid}"))
     kb.row(_btn("🔄 Sync with Telegram", f"sync:{cid}"), _btn("🔁 Run expiry check", f"fcheck:{cid}"))
-    kb.row(_btn("🔐 Check permissions", f"perms:{cid}"))
+    kb.row(_btn("📥 Export CSV", f"export:{cid}"), _btn("🔐 Check permissions", f"perms:{cid}"))
     kb.row(_btn("◀️ Dashboard", f"dash:{cid}"), _home())
+    return kb.as_markup()
+
+
+def export_keyboard(chat_id: int, counts: dict[str, int] | None = None) -> InlineKeyboardMarkup:
+    """Scope picker for the CSV export: everyone, or one of the member views."""
+    kb = InlineKeyboardBuilder()
+    total = sum((counts or {}).get(k, 0) for k in ("active", "past"))
+    kb.row(_btn(f"📥 Everyone · {total}" if counts else "📥 Everyone", f"exportv:{chat_id}:all"))
+    buttons = []
+    for key, label, icon in MEMBER_VIEWS:
+        n = (counts or {}).get(key)
+        buttons.append(_btn(f"{icon} {label}" + (f" · {n}" if n is not None else ""), f"exportv:{chat_id}:{key}"))
+    kb.row(*buttons[:2])
+    kb.row(*buttons[2:])
+    kb.row(_btn("◀️ Tools", f"tools:{chat_id}"), _home())
     return kb.as_markup()
 
 
@@ -286,6 +323,10 @@ def advanced_keyboard(chat: Chat) -> InlineKeyboardMarkup:
     )
     kb.row(_btn(approve, f"set:{cid}:approve"))
     kb.row(_btn(f"🔔 Prompts → {'👑 Owner' if chat.ask_target == 'owner' else '👮 All admins'}", f"set:{cid}:asktarget"))
+    kb.row(
+        _btn(f"⏱ Grace · {grace_label(chat.grace_hours)}", f"set:{cid}:grace"),
+        _btn(f"{onoff(chat.digest_enabled)} Daily digest", f"set:{cid}:digest"),
+    )
     kb.row(_btn("✏️ Welcome text", f"edit:{cid}:welcome"), _btn("📨 Log channel", f"edit:{cid}:log"))
     kb.row(_btn("◀️ Settings", f"settings:{cid}"), _home())
     return kb.as_markup()

@@ -96,10 +96,24 @@ def tools_screen(chat: Chat) -> Screen:
     text = (
         f"🛠 <b>Tools — {escape(chat.display)}</b>\n\n"
         "Powerful, less frequent actions.\n"
-        "<i>Add / search members, message everyone, review VIPs, or re-check "
-        "Telegram and expiries on demand.</i>"
+        "<i>Add / search members, message everyone, review VIPs, export a spreadsheet, "
+        "or re-check Telegram and expiries on demand.</i>"
     )
     return text, K.tools_keyboard(chat)
+
+
+async def export_screen(db: Database, chat: Chat) -> Screen:
+    """Pick which members to export as CSV."""
+    counts = await db.member_view_counts(chat.chat_id, _soon())
+    total = counts.get("active", 0) + counts.get("past", 0)
+    text = (
+        f"📥 <b>Export CSV — {escape(chat.display)}</b>\n\n"
+        f"<b>{total}</b> tracked member{'s' if total != 1 else ''} in total.\n"
+        "Choose who to include — I'll send a spreadsheet file with name, username, ID, "
+        "status, join &amp; expiry dates, remaining time, source, renewals and notes.\n\n"
+        "<i>Opens in Excel, Numbers and Google Sheets.</i>"
+    )
+    return text, K.export_keyboard(chat.chat_id, counts)
 
 
 # ---------------------------------------------------------------- settings
@@ -131,12 +145,20 @@ def advanced_screen(chat: Chat) -> Screen:
     approve = {0: "ignored", 1: "auto-approved", 2: "you are asked"}.get(chat.approve_requests, "ignored")
     welcome = "custom text" if chat.welcome_text else "default text"
     log = f"<code>{chat.log_chat_id}</code>" if chat.log_chat_id else "off"
+    grace = (
+        f"<b>{K.grace_label(chat.grace_hours)}</b> after expiry before removal"
+        if chat.grace_hours
+        else "<b>off</b> · removed right at expiry"
+    )
+    digest = "<b>on</b> · one DM per day listing members expiring soon" if chat.digest_enabled else "<b>off</b>"
     text = (
         f"🔧 <b>Advanced — {escape(chat.display)}</b>\n\n"
         f"💬 Member DMs (reminders, notices): <b>{'on' if chat.notify_user else 'off'}</b>\n"
         f"👋 Welcome message: <b>{'on' if chat.welcome_enabled else 'off'}</b> · {welcome}\n"
         f"🙋 Join requests: <b>{approve}</b>\n"
         f"🔔 Prompts go to: <b>{'the owner' if chat.ask_target == 'owner' else 'all admins'}</b>\n"
+        f"⏱ Grace period: {grace}\n"
+        f"📬 Daily digest: {digest}\n"
         f"📨 Log channel: <b>{log}</b>"
     )
     return text, K.advanced_keyboard(chat)

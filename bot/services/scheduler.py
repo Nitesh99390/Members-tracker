@@ -4,10 +4,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
-from typing import Awaitable, Callable
 
 from aiogram.types import FSInputFile
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -28,6 +28,9 @@ MAX_FAILS_BEFORE_BACKOFF = 5
 # how many removals / reminder DMs run at the same time
 REMOVE_CONCURRENCY = 4
 REMIND_CONCURRENCY = 8
+# daily digest: look-ahead window and how many names to list per chat
+DIGEST_DAYS = 3
+DIGEST_ROWS = 15
 
 
 class ExpiryScheduler:
@@ -81,6 +84,14 @@ class ExpiryScheduler:
             self.maintenance,
             CronTrigger(hour=self.settings.backup_hour_utc, minute=15),
             id="maintenance",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
+        self.scheduler.add_job(
+            self.send_digests,
+            CronTrigger(hour=self.settings.digest_hour, minute=0, timezone=self.settings.tz),
+            id="daily_digest",
             max_instances=1,
             coalesce=True,
             misfire_grace_time=3600,
@@ -270,6 +281,58 @@ class ExpiryScheduler:
             await refresh_chat_admins(self.service.bot, self.db, chat.chat_id)
             await self.service.get_owner_id(chat, refresh=True)
             await asyncio.sleep(0.2)
+
+    # ---------------------------------------------------------- digest
+    def digest_text(self, chat: Chat, members: list[Member], now: datetime | None = None) -> str | None:
+        """One compact DM: who expires within :data:`DIGEST_DAYS`. ``None`` when nobody does."""
+        if not members:
+            return None
+        now = now or datetime.now(timezone.utc)
+        lines = [
+            f"📬 <b>Daily digest — {escape(chat.display)}</b>",
+            f"<b>{len(members)}</b> member{'s' if len(members) != 1 else ''} expiring within {DIGEST_DAYS} days:",
+            "",
+        ]
+        for m in members[:DIGEST_ROWS]:
+            if m.expires_at is None:
+                continue
+            lines.append(
+                f"• {m.mention_html} · <code>{m.user_id}</code> · "
+                f"{humanize_delta(m.expires_at - now)} · {format_dt(m.expires_at, self.settings.tz)}"
+            )
+        if len(members) > DIGEST_ROWS:
+            lines.append(f"<i>…and {len(members) - DIGEST_ROWS} more</i>")
+        lines.append("")
+        lines.append("<i>Open ⏰ Expiring on the dashboard to extend them in one tap.</i>")
+        return "\n".join(lines)
+
+    async def send_digests(self) -> int:
+        """DM owner/admins of every opted-in chat a list of members expiring soon."""
+        sent = 0
+        now = datetime.now(timezone.utc)
+        horizon = now + timedelta(days=DIGEST_DAYS)
+        for chat in await self.db.digest_chats():
+            try:
+                members = await self.db.expiring_members(horizon, chat.chat_id)
+                text = self.digest_text(chat, members, now)
+                if text is None:
+                    continue
+                recipients = await self.service.prompt_recipients(chat)
+                delivered = 0
+                for uid in recipients:
+                    if await self.service.dm_user(uid, text):
+                        delivered += 1
+                if delivered:
+                    sent += 1
+                await self.db.add_log(chat.chat_id, None, "digest", f"{len(members)} expiring → {delivered} admin(s)")
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Digest for %s failed: %s", chat.chat_id, exc)
+                self.metrics.inc("scheduler_step_errors")
+            await asyncio.sleep(0.1)
+        self.metrics.inc("digests_sent", sent)
+        if sent:
+            log.info("Daily digest sent for %s chat(s)", sent)
+        return sent
 
     # ------------------------------------------------------ housekeeping
     async def housekeeping(self) -> None:

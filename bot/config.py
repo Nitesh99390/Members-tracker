@@ -99,6 +99,7 @@ class Settings:
     backup_chat_id: int | None = None
     backup_hour_utc: int = 3
     notify_admins_on_error: bool = True
+    digest_hour: int = 9  # local hour (TIMEZONE) for the daily expiring digest
     # --- protection ----------------------------------------------------------
     throttle_rate: float = 0.5  # min seconds between actions per user
     throttle_burst: int = 5  # actions allowed in a burst before throttling
@@ -126,7 +127,7 @@ class Settings:
             return ZoneInfo("UTC")
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         token = os.getenv("BOT_TOKEN", "").strip()
         if not token:
             raise RuntimeError(
@@ -197,6 +198,7 @@ class Settings:
             backup_chat_id=_env_optional_int("BACKUP_CHAT_ID"),
             backup_hour_utc=_env_int("BACKUP_HOUR_UTC", 3, minimum=0, maximum=23),
             notify_admins_on_error=_env_bool("NOTIFY_ADMINS_ON_ERROR", True),
+            digest_hour=_env_int("DIGEST_HOUR", 9, minimum=0, maximum=23),
             throttle_rate=max(0.1, _env_float("THROTTLE_RATE", 0.5)),
             throttle_burst=_env_int("THROTTLE_BURST", 5, minimum=1, maximum=50),
             http_host=os.getenv("HTTP_HOST", "0.0.0.0").strip() or "0.0.0.0",

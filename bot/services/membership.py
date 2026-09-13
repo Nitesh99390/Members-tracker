@@ -262,7 +262,7 @@ class MembershipService:
             *(self.safe_send(admin_id, text, reply_markup=kb) for admin_id in recipients)
         )
         delivered = 0
-        for admin_id, msg in zip(recipients, results):
+        for admin_id, msg in zip(recipients, results, strict=True):
             if msg:
                 delivered += 1
                 await self.db.add_prompt_message(pending_id, admin_id, msg.message_id)
