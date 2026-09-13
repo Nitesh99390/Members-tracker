@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import aiosqlite
 
@@ -141,6 +142,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("chats", "ask_target", "TEXT NOT NULL DEFAULT 'owner'"),  # owner | admins
     ("chats", "owner_id", "INTEGER"),
     ("chats", "grace_hours", "INTEGER NOT NULL DEFAULT 0"),  # grace after expiry before removal
+    ("chats", "digest_enabled", "INTEGER NOT NULL DEFAULT 0"),  # daily "expiring soon" DM to admins
     ("members", "fail_count", "INTEGER NOT NULL DEFAULT 0"),
     ("members", "source", "TEXT"),  # join | request | invite:<link> | manual
     ("members", "renewals", "INTEGER NOT NULL DEFAULT 0"),
@@ -201,9 +203,10 @@ class Chat:
     ask_target: str = "owner"
     owner_id: int | None = None
     grace_hours: int = 0
+    digest_enabled: bool = False
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> "Chat":
+    def from_row(cls, row: aiosqlite.Row) -> Chat:
         ask = _row_get(row, "ask_on_join")
         return cls(
             chat_id=row["chat_id"],
@@ -224,6 +227,7 @@ class Chat:
             ask_target=_row_get(row, "ask_target", "owner") or "owner",
             owner_id=_row_get(row, "owner_id"),
             grace_hours=int(_row_get(row, "grace_hours", 0) or 0),
+            digest_enabled=bool(_row_get(row, "digest_enabled", 0) or 0),
         )
 
     @property
@@ -252,7 +256,7 @@ class Member:
     renewals: int = 0
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> "Member":
+    def from_row(cls, row: aiosqlite.Row) -> Member:
         sent: set[int] = set()
         for x in (row["reminders_sent"] or "").split(","):
             x = x.strip()
@@ -307,7 +311,7 @@ class PendingJoin:
     decision: str | None
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> "PendingJoin":
+    def from_row(cls, row: aiosqlite.Row) -> PendingJoin:
         return cls(
             id=row["id"],
             chat_id=row["chat_id"],
@@ -346,7 +350,7 @@ class InviteLink:
     revoked: bool
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> "InviteLink":
+    def from_row(cls, row: aiosqlite.Row) -> InviteLink:
         return cls(
             invite_link=row["invite_link"],
             chat_id=row["chat_id"],
@@ -529,6 +533,13 @@ class Database:
         # cache negatives too (very short) so unknown-chat spam doesn't hammer the DB
         self._chat_cache.set(chat_id, chat, ttl=None if chat else 5.0)
         return chat
+
+    async def digest_chats(self) -> list[Chat]:
+        """Tracked chats whose admins want the daily expiring digest."""
+        rows = await self._fetchall(
+            "SELECT * FROM chats WHERE tracking_enabled=1 AND digest_enabled=1 ORDER BY created_at"
+        )
+        return [Chat.from_row(r) for r in rows]
 
     async def list_chats(self, only_tracking: bool = False) -> list[Chat]:
         sql = "SELECT * FROM chats"
@@ -738,6 +749,16 @@ class Database:
     async def iter_all_members(self, chat_id: int) -> list[Member]:
         rows = await self._fetchall(
             "SELECT * FROM members WHERE chat_id=? ORDER BY joined_at", (chat_id,)
+        )
+        return [Member.from_row(r) for r in rows]
+
+    async def members_for_export(self, chat_id: int, view: str = "all", limit: int = 50000) -> list[Member]:
+        """Every member matching a named view, ordered for a human-readable export."""
+        frag, params = self._filter_sql(view if view in self.MEMBER_FILTERS else "all", None)
+        rows = await self._fetchall(
+            f"""SELECT * FROM members WHERE chat_id=? AND {frag}
+                ORDER BY status='active' DESC, expires_at IS NULL, expires_at ASC, joined_at ASC LIMIT ?""",
+            [chat_id, *params, limit],
         )
         return [Member.from_row(r) for r in rows]
 

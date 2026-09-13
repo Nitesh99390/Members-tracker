@@ -12,6 +12,7 @@ tapping, typing is only needed for free-form values (custom dates, texts):
 ``pending``/``pall``/``pallc``/``jd``/``jm``/``jr``/``jb``/``jc`` join prompts
 ``invites``/``inpick``/``inew``/``incust``/``irev``/``irevc`` invite links
 ``addm``/``search``/``bcast``/``bcastc``/``vips``/``sync``/``fcheck``/``perms`` tools
+``export``   ``export:<cid>`` scope picker · ``exportv:<cid>:<view>`` send the CSV
 ===========  ======================================================
 """
 from __future__ import annotations
@@ -27,18 +28,30 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from bot.config import Settings
 from bot.handlers import screens as S
 from bot.handlers.common import HELP_TOPICS, home_text, mystatus_text
+from bot.services import export as X
 from bot.services.database import Chat, Database
 from bot.services.membership import MembershipService
 from bot.services.scheduler import ExpiryScheduler
 from bot.utils import keyboards as K
 from bot.utils.permissions import bot_can_restrict, is_admin
 from bot.utils.telegram import is_not_modified, tg_call
-from bot.utils.timeparse import ParseError, describe_duration, format_dt, is_permanent, parse_duration
+from bot.utils.timeparse import (
+    ParseError,
+    describe_duration,
+    format_dt,
+    is_permanent,
+    parse_duration,
+)
 from bot.utils.ui import progress_bar
 
 log = logging.getLogger(__name__)
@@ -296,7 +309,7 @@ async def cb_toggle(
 
     updates: dict[str, object] = {}
     note = "Saved"
-    advanced = key in ("notify", "welcome", "approve", "asktarget")
+    advanced = key in ("notify", "welcome", "approve", "asktarget", "grace", "digest")
     if key == "mode":
         updates["kick_mode"] = "ban" if chat.kick_mode == "kick" else "kick"
         note = "Expired members are banned" if updates["kick_mode"] == "ban" else "Expired members are kicked (can rejoin)"
@@ -323,6 +336,16 @@ async def cb_toggle(
         note = {0: "Join requests ignored", 1: "Join requests auto-approved", 2: "You'll be asked on each request"}[
             updates["approve_requests"]
         ]
+    elif key == "grace":
+        updates["grace_hours"] = K.next_grace(chat.grace_hours)
+        note = (
+            f"Expired members get {K.grace_label(updates['grace_hours'])} of grace before removal"
+            if updates["grace_hours"]
+            else "Removed right at expiry"
+        )
+    elif key == "digest":
+        updates["digest_enabled"] = int(not chat.digest_enabled)
+        note = "You'll get a daily expiring-soon digest" if updates["digest_enabled"] else "Daily digest off"
     else:
         await call.answer("Unknown setting")
         return
@@ -920,7 +943,7 @@ async def cb_invite_revoke_confirm(call: CallbackQuery, bot: Bot, db: Database, 
     chat = await _authorised(call, bot, db, settings, chat_id)
     if not chat:
         return
-    target = next((l for l in await db.list_invite_links(chat_id) if l.invite_link.endswith(suffix)), None)
+    target = next((lnk for lnk in await db.list_invite_links(chat_id) if lnk.invite_link.endswith(suffix)), None)
     if not target:
         await call.answer("Link not found", show_alert=True)
         return
@@ -943,7 +966,7 @@ async def cb_invite_revoke(
     chat = await _authorised(call, bot, db, settings, chat_id)
     if not chat:
         return
-    target = next((l for l in await db.list_invite_links(chat_id) if l.invite_link.endswith(suffix)), None)
+    target = next((lnk for lnk in await db.list_invite_links(chat_id) if lnk.invite_link.endswith(suffix)), None)
     if not target:
         await call.answer("Link not found", show_alert=True)
         return
@@ -1111,6 +1134,48 @@ async def cb_permissions(call: CallbackQuery, bot: Bot, db: Database, settings: 
         K.cancel_keyboard(f"tools:{chat_id}", "◀️ Tools"),
     )
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("export:"))
+async def cb_export(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
+    chat_id = int(_ids(call.data, 1)[0])
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    await state.clear()
+    await _show(call, await S.export_screen(db, chat))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("exportv:"))
+async def cb_export_view(call: CallbackQuery, bot: Bot, db: Database, settings: Settings) -> None:
+    chat_id_s, view = _ids(call.data, 2)
+    chat_id = int(chat_id_s)
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat or call.message is None:
+        return
+    if view not in dict(X.EXPORT_VIEWS):
+        view = "all"
+    members = await db.members_for_export(chat_id, view)
+    if not members:
+        await call.answer("Nothing to export for that selection.", show_alert=True)
+        return
+    await call.answer("Preparing file…")
+    data = X.members_csv(members, settings.tz)
+    document = BufferedInputFile(data, filename=X.export_filename(chat, view))
+    try:
+        await tg_call(
+            bot.send_document,
+            call.message.chat.id,
+            document,
+            caption=escape(X.export_caption(chat, view, len(members))),
+            retries=1,
+            label="send_export",
+        )
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        await call.answer(f"Could not send the file: {exc.message}", show_alert=True)
+        return
+    await db.add_log(chat_id, None, "export", f"{view} {len(members)} rows", call.from_user.id)
 
 
 # ------------------------------------------------------------ misc buttons

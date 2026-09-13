@@ -15,7 +15,8 @@ import asyncio
 import logging
 import time
 from collections import defaultdict, deque
-from typing import Any, Awaitable, Callable
+from typing import Any
+from collections.abc import Awaitable, Callable
 
 from aiogram import BaseMiddleware
 from aiogram.exceptions import TelegramBadRequest

@@ -148,7 +148,7 @@ async def register_commands(bot: Bot, settings: Settings) -> None:
             ),
             return_exceptions=True,
         )
-        for uid, res in zip(settings.super_admins, results):
+        for uid, res in zip(settings.super_admins, results, strict=True):
             if isinstance(res, Exception):
                 log.debug("Cannot set commands for %s: %s", uid, res)
     except Exception as exc:  # noqa: BLE001

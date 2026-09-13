@@ -10,7 +10,7 @@ from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
-from aiogram.types import FSInputFile, Message
+from aiogram.types import BufferedInputFile, FSInputFile, Message
 
 from bot import VERSION_TAG, __version__
 from bot.config import Settings
@@ -21,12 +21,14 @@ from bot.handlers.screens import (  # noqa: F401 - re-exported for backwards com
     settings_text,
     stats_text,
 )
+from bot.services import export as X
 from bot.services.database import Chat, Database, Member
 from bot.services.membership import MembershipService
 from bot.services.metrics import Metrics
 from bot.services.scheduler import ExpiryScheduler
 from bot.utils.keyboards import (
     chats_keyboard,
+    grace_label,
     member_keyboard,
     open_private_keyboard,
     settings_keyboard,
@@ -804,7 +806,7 @@ async def cmd_revoke(
         await _usage(message, "/revoke &lt;invite link&gt;")
         return
     target = next(
-        (l for l in await db.list_invite_links(chat.chat_id) if l.invite_link.endswith(arg.split("/")[-1])),
+        (lnk for lnk in await db.list_invite_links(chat.chat_id) if lnk.invite_link.endswith(arg.split("/")[-1])),
         None,
     )
     if not target:
@@ -860,6 +862,78 @@ async def cmd_sync(
         f"✅ <b>Sync complete</b>\nChecked: <b>{result['checked']}</b> • "
         f"Left/removed: <b>{result['gone']}</b> • Errors: <b>{result['errors']}</b>"
     )
+
+
+@router.message(Command("export", "csv"))
+async def cmd_export(
+    message: Message, command: CommandObject, bot: Bot, db: Database, settings: Settings
+) -> None:
+    """``/export [all|active|soon|lifetime|past]`` — send the member list as a CSV file."""
+    chat = await resolve_chat(message, bot, db, settings)
+    if not chat:
+        return
+    view = (command.args or "all").strip().lower() or "all"
+    if view not in dict(X.EXPORT_VIEWS):
+        await _usage(message, "/export [all | active | soon | lifetime | past]")
+        return
+    members = await db.members_for_export(chat.chat_id, view)
+    if not members:
+        await message.reply("Nothing to export for that selection.")
+        return
+    data = X.members_csv(members, settings.tz)
+    await message.reply_document(
+        BufferedInputFile(data, filename=X.export_filename(chat, view)),
+        caption=escape(X.export_caption(chat, view, len(members))),
+    )
+    await db.add_log(chat.chat_id, None, "export", f"{view} {len(members)} rows", message.from_user.id)
+
+
+@router.message(Command("setgrace", "grace"))
+async def cmd_setgrace(
+    message: Message, command: CommandObject, bot: Bot, db: Database, settings: Settings
+) -> None:
+    """``/setgrace <hours|off>`` — keep expired members for a while before removing them."""
+    chat = await resolve_chat(message, bot, db, settings)
+    if not chat:
+        return
+    raw = (command.args or "").strip().lower()
+    if not raw:
+        await message.reply(
+            f"⏱ Grace period: <b>{grace_label(chat.grace_hours)}</b>\n"
+            "Usage: <code>/setgrace 24</code> (hours) · <code>/setgrace 3d</code> · <code>/setgrace off</code>"
+        )
+        return
+    if raw in ("off", "0", "none"):
+        hours = 0
+    else:
+        try:
+            hours = parse_grace(raw)
+        except ValueError as exc:
+            await message.reply(f"⚠️ {escape(str(exc))}")
+            return
+    await db.update_chat(chat.chat_id, grace_hours=hours)
+    await db.add_log(chat.chat_id, None, "set_grace", str(hours), message.from_user.id)
+    await message.reply(
+        f"⏱ Expired members are now removed after a grace period of <b>{grace_label(hours)}</b>."
+        if hours
+        else "⏱ Grace period off — expired members are removed right away."
+    )
+
+
+def parse_grace(raw: str) -> int:
+    """``24`` / ``24h`` / ``3d`` → hours. Capped at 30 days."""
+    text = raw.strip().lower()
+    mult = 1
+    if text.endswith("d"):
+        mult, text = 24, text[:-1]
+    elif text.endswith("h"):
+        text = text[:-1]
+    if not text.isdigit():
+        raise ValueError("Give the grace period in hours (e.g. 24, 12h) or days (e.g. 3d), or 'off'.")
+    hours = int(text) * mult
+    if hours > 24 * 30:
+        raise ValueError("Grace period cannot exceed 30 days.")
+    return hours
 
 
 @router.message(Command("backup"))

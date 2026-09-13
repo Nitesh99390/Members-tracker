@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import time
 from collections import OrderedDict
-from typing import Any, Callable, Generic, Hashable, TypeVar
+from typing import Any, Generic, TypeVar
+from collections.abc import Callable, Hashable
 
 K = TypeVar("K", bound=Hashable)
 V = TypeVar("V")
