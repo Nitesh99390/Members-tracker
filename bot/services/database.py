@@ -11,6 +11,8 @@ from typing import Any, Iterable
 
 import aiosqlite
 
+from bot.utils.cache import TTLCache
+
 log = logging.getLogger(__name__)
 
 SCHEMA = """
@@ -49,6 +51,9 @@ CREATE TABLE IF NOT EXISTS members (
     FOREIGN KEY (chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_members_expiry ON members(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_members_chat_status ON members(chat_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_members_user ON members(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_members_username ON members(chat_id, username COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS whitelist (
     chat_id  INTEGER NOT NULL,
@@ -74,6 +79,8 @@ CREATE TABLE IF NOT EXISTS logs (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_logs_chat ON logs(chat_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_logs_user ON logs(chat_id, user_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at);
 
 CREATE TABLE IF NOT EXISTS user_context (
     user_id  INTEGER PRIMARY KEY,
@@ -97,6 +104,7 @@ CREATE TABLE IF NOT EXISTS pending_joins (
     UNIQUE (chat_id, user_id, status) ON CONFLICT REPLACE
 );
 CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_joins(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_pending_chat ON pending_joins(chat_id, status);
 
 -- Messages sent to admins for a pending join (so we can edit them all once decided)
 CREATE TABLE IF NOT EXISTS prompt_messages (
@@ -137,6 +145,9 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("members", "source", "TEXT"),  # join | request | invite:<link> | manual
     ("members", "renewals", "INTEGER NOT NULL DEFAULT 0"),
 ]
+
+
+_MISSING = object()
 
 
 def utcnow() -> datetime:
@@ -353,12 +364,25 @@ class Database:
 
     All writes go through :meth:`_exec` which commits immediately; a lock
     guarantees that multi-statement operations are not interleaved.
+
+    Hot read paths (chat settings, admin/whitelist membership, user context)
+    are served from small TTL caches that are invalidated on every write, so
+    button presses feel instant even on a busy bot.
     """
 
-    def __init__(self, path: str) -> None:
+    CACHE_TTL = 120.0
+
+    def __init__(self, path: str, cache_ttl: float | None = None) -> None:
         self.path = path
         self._conn: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
+        ttl = self.CACHE_TTL if cache_ttl is None else cache_ttl
+        self._chat_cache: TTLCache[int, Chat] = TTLCache(ttl=ttl, maxsize=1024)
+        self._admin_cache: TTLCache[tuple[int, int], bool] = TTLCache(ttl=ttl, maxsize=8192)
+        self._wl_cache: TTLCache[tuple[int, int], bool] = TTLCache(ttl=ttl, maxsize=8192)
+        self._ctx_cache: TTLCache[int, int] = TTLCache(ttl=ttl * 5, maxsize=4096)
+        self.queries = 0
+        self.writes = 0
 
     async def connect(self) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -368,10 +392,38 @@ class Database:
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._conn.execute("PRAGMA busy_timeout=30000")
+        await self._conn.execute("PRAGMA temp_store=MEMORY")
+        await self._conn.execute("PRAGMA cache_size=-16000")  # ~16 MB page cache
+        await self._conn.execute("PRAGMA mmap_size=134217728")  # 128 MB, ignored if unsupported
         await self._conn.executescript(SCHEMA)
         await self._migrate()
         await self._conn.commit()
         log.info("Database ready at %s", self.path)
+
+    # ---------------------------------------------------------------- cache
+    def cache_stats(self) -> dict[str, Any]:
+        return {
+            "chats": self._chat_cache.stats(),
+            "admins": self._admin_cache.stats(),
+            "whitelist": self._wl_cache.stats(),
+            "context": self._ctx_cache.stats(),
+            "queries": self.queries,
+            "writes": self.writes,
+        }
+
+    def purge_caches(self) -> int:
+        return sum(
+            c.purge_expired() for c in (self._chat_cache, self._admin_cache, self._wl_cache, self._ctx_cache)
+        )
+
+    def _forget_chat(self, chat_id: int) -> None:
+        self._chat_cache.pop(chat_id)
+
+    def _forget_chat_everything(self, chat_id: int) -> None:
+        self._chat_cache.pop(chat_id)
+        self._admin_cache.invalidate_where(lambda k: k[0] == chat_id)
+        self._wl_cache.invalidate_where(lambda k: k[0] == chat_id)
+        self._ctx_cache.invalidate_where(lambda _k: True)  # contexts may point at this chat
 
     async def _migrate(self) -> None:
         """Add columns that were introduced after the first release."""
@@ -399,18 +451,31 @@ class Database:
         return self._conn
 
     async def _exec(self, sql: str, params: Iterable[Any] = ()) -> int:
+        self.writes += 1
         async with self._write_lock:
             cur = await self.conn.execute(sql, tuple(params))
             await self.conn.commit()
             return cur.rowcount
 
     async def _fetchone(self, sql: str, params: Iterable[Any] = ()) -> aiosqlite.Row | None:
+        self.queries += 1
         async with self.conn.execute(sql, tuple(params)) as cur:
             return await cur.fetchone()
 
     async def _fetchall(self, sql: str, params: Iterable[Any] = ()) -> list[aiosqlite.Row]:
+        self.queries += 1
         async with self.conn.execute(sql, tuple(params)) as cur:
             return list(await cur.fetchall())
+
+    async def optimize(self) -> None:
+        """Run SQLite's self-tuning + WAL checkpoint; cheap, safe to call daily."""
+        async with self._write_lock:
+            try:
+                await self.conn.execute("PRAGMA optimize")
+                await self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                await self.conn.commit()
+            except Exception as exc:  # noqa: BLE001 - never fatal
+                log.debug("optimize failed: %s", exc)
 
     async def backup_to(self, dest: str) -> str:
         """Create a consistent copy of the database file at ``dest``."""
@@ -450,13 +515,20 @@ class Database:
             """,
             (chat_id, title, chat_type, username, added_by, now, now),
         )
+        self._forget_chat(chat_id)
         chat = await self.get_chat(chat_id)
         assert chat is not None
         return chat
 
     async def get_chat(self, chat_id: int) -> Chat | None:
+        cached = self._chat_cache.get(chat_id, _MISSING)
+        if cached is not _MISSING:
+            return cached
         row = await self._fetchone("SELECT * FROM chats WHERE chat_id=?", (chat_id,))
-        return Chat.from_row(row) if row else None
+        chat = Chat.from_row(row) if row else None
+        # cache negatives too (very short) so unknown-chat spam doesn't hammer the DB
+        self._chat_cache.set(chat_id, chat, ttl=None if chat else 5.0)
+        return chat
 
     async def list_chats(self, only_tracking: bool = False) -> list[Chat]:
         sql = "SELECT * FROM chats"
@@ -472,12 +544,15 @@ class Database:
         values = list(fields.values())
         values.extend([to_iso(utcnow()), chat_id])
         await self._exec(f"UPDATE chats SET {cols}, updated_at=? WHERE chat_id=?", values)
+        self._forget_chat(chat_id)
 
     async def delete_chat(self, chat_id: int) -> None:
+        self.writes += 1
         async with self._write_lock:
             for table in ("members", "whitelist", "chat_admins", "invite_links", "pending_joins", "chats"):
                 await self.conn.execute(f"DELETE FROM {table} WHERE chat_id=?", (chat_id,))
             await self.conn.commit()
+        self._forget_chat_everything(chat_id)
 
     # ---------------------------------------------------------------- members
     async def upsert_member(
@@ -693,15 +768,21 @@ class Database:
             "INSERT OR IGNORE INTO whitelist (chat_id, user_id, added_by, created_at) VALUES (?, ?, ?, ?)",
             (chat_id, user_id, added_by, to_iso(utcnow())),
         )
+        self._wl_cache.set((chat_id, user_id), True)
 
     async def remove_whitelist(self, chat_id: int, user_id: int) -> None:
         await self._exec("DELETE FROM whitelist WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        self._wl_cache.set((chat_id, user_id), False)
 
     async def is_whitelisted(self, chat_id: int, user_id: int) -> bool:
+        key = (chat_id, user_id)
+        cached = self._wl_cache.get(key, _MISSING)
+        if cached is not _MISSING:
+            return bool(cached)
         row = await self._fetchone(
-            "SELECT 1 FROM whitelist WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+            "SELECT 1 FROM whitelist WHERE chat_id=? AND user_id=?", key
         )
-        return row is not None
+        return self._wl_cache.set(key, row is not None)
 
     async def list_whitelist(self, chat_id: int) -> list[int]:
         rows = await self._fetchall(
@@ -711,23 +792,32 @@ class Database:
 
     # ------------------------------------------------------------ chat admins
     async def set_chat_admins(self, chat_id: int, user_ids: Iterable[int]) -> None:
+        ids = list(user_ids)
+        self.writes += 1
         async with self._write_lock:
             await self.conn.execute("DELETE FROM chat_admins WHERE chat_id=?", (chat_id,))
             await self.conn.executemany(
                 "INSERT OR IGNORE INTO chat_admins (chat_id, user_id) VALUES (?, ?)",
-                [(chat_id, uid) for uid in user_ids],
+                [(chat_id, uid) for uid in ids],
             )
             await self.conn.commit()
+        self._admin_cache.invalidate_where(lambda k: k[0] == chat_id)
+        for uid in ids:
+            self._admin_cache.set((chat_id, uid), True)
 
     async def list_chat_admins(self, chat_id: int) -> list[int]:
         rows = await self._fetchall("SELECT user_id FROM chat_admins WHERE chat_id=?", (chat_id,))
         return [int(r["user_id"]) for r in rows]
 
     async def is_chat_admin(self, chat_id: int, user_id: int) -> bool:
+        key = (chat_id, user_id)
+        cached = self._admin_cache.get(key, _MISSING)
+        if cached is not _MISSING:
+            return bool(cached)
         row = await self._fetchone(
-            "SELECT 1 FROM chat_admins WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+            "SELECT 1 FROM chat_admins WHERE chat_id=? AND user_id=?", key
         )
-        return row is not None
+        return self._admin_cache.set(key, row is not None)
 
     async def chats_for_admin(self, user_id: int) -> list[Chat]:
         rows = await self._fetchall(
@@ -771,15 +861,24 @@ class Database:
 
     # ----------------------------------------------------------- user context
     async def set_context(self, user_id: int, chat_id: int) -> None:
+        if self._ctx_cache.peek(user_id) == chat_id:
+            return  # already selected: skip the write entirely
         await self._exec(
             """INSERT INTO user_context (user_id, chat_id, updated_at) VALUES (?, ?, ?)
                ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id, updated_at=excluded.updated_at""",
             (user_id, chat_id, to_iso(utcnow())),
         )
+        self._ctx_cache.set(user_id, chat_id)
 
     async def get_context(self, user_id: int) -> int | None:
+        cached = self._ctx_cache.get(user_id, _MISSING)
+        if cached is not _MISSING:
+            return cached
         row = await self._fetchone("SELECT chat_id FROM user_context WHERE user_id=?", (user_id,))
-        return int(row["chat_id"]) if row else None
+        value = int(row["chat_id"]) if row else None
+        if value is not None:
+            self._ctx_cache.set(user_id, value)
+        return value
 
     # ---------------------------------------------------------- pending joins
     async def create_pending(

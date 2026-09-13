@@ -33,6 +33,8 @@ Built with Python 3.11+, [aiogram 3](https://docs.aiogram.dev/), SQLite and APSc
 | **Maintenance** | Daily log pruning + SQLite backup (optionally sent to a chat), `/backup` and `/health` for super-admins, rotating log files. |
 | **Protection** | Per-user anti-spam throttling for commands/buttons; unhandled errors are DM'd to super-admins. |
 | **Robust** | Rate-limit aware, retries failed removals with backoff, permission checks, admin-cache refresh, WAL SQLite, schema auto-migration. |
+| **Fast** | In-memory TTL caches for chat settings / admin & whitelist checks, covering SQLite indexes, concurrent (bounded) removals, reminders, prompts and broadcasts, instant callback acks with double-tap de-duplication. |
+| **Ops-ready** | Long polling **or webhook** mode, optional HTTP side-car with `/healthz` · `/readyz` · `/metrics` (Prometheus), JSON logs, graceful SIGTERM shutdown, startup retries when Telegram is unreachable, Docker `HEALTHCHECK`. |
 
 ---
 
@@ -81,6 +83,39 @@ pm2 logs member-tracker-bot --nostream
 | `BACKUP_HOUR_UTC` | `3` | Hour (UTC) for daily maintenance (log pruning + backup) |
 | `NOTIFY_ADMINS_ON_ERROR` | `true` | DM super-admins on unhandled errors |
 | `THROTTLE_RATE` / `THROTTLE_BURST` | `0.5` / `5` | Anti-spam: allow `BURST` actions, then min `RATE` seconds between actions |
+| `HTTP_PORT` / `HTTP_HOST` | – / `0.0.0.0` | Enable the HTTP side-car (`/healthz`, `/readyz`, `/metrics`). Empty = disabled |
+| `WEBHOOK_URL` | – | Public `https://` base URL → switch from polling to webhook mode (implies `HTTP_PORT=8080`) |
+| `WEBHOOK_PATH` / `WEBHOOK_SECRET` | `/webhook` / – | Webhook receiver path and secret token Telegram must echo back |
+| `LOG_JSON` | `false` | Structured JSON log lines instead of human-readable text |
+| `DROP_PENDING_UPDATES` | `false` | Discard updates queued while the bot was offline |
+| `CACHE_TTL` | `120` | Seconds to cache chat settings / admin checks in memory (`0` disables) |
+
+### Polling vs. webhook
+
+* **Polling** (default) – zero configuration, works behind NAT. Leave `WEBHOOK_URL` empty.
+* **Webhook** – lower latency on busy bots. Put the bot behind an HTTPS reverse proxy
+  (Caddy / nginx / Cloudflare Tunnel) and set:
+
+  ```env
+  WEBHOOK_URL=https://bot.example.com
+  WEBHOOK_SECRET=some-random-string
+  HTTP_PORT=8080
+  ```
+
+  The bot registers `https://bot.example.com/webhook` with Telegram on start-up and
+  serves it from the same aiohttp side-car as `/healthz`.
+
+### Health & metrics
+
+With `HTTP_PORT` set:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /healthz` | Liveness – process up, SQLite answers |
+| `GET /readyz` | Readiness – authenticated, polling/webhook active, scheduler not stale |
+| `GET /metrics` | Prometheus text format (`?format=json` for JSON): updates, errors, throttled taps, handler latency p95, removals, reminders, cache hit-rates, DB size… |
+
+`/health` in Telegram (super-admins) shows the same numbers inline.
 
 ---
 
@@ -156,10 +191,11 @@ All commands still work; they are simply not advertised in the menu.
 ## 🗂 Project structure
 
 ```
-main.py                      # entry point, polling, command menus
+main.py                      # entry point: polling/webhook, HTTP side-car, graceful shutdown
 bot/
   config.py                  # env settings
-  middlewares.py             # dependency injection, throttling, error reporting
+  middlewares.py             # DI, metrics, throttling, callback ack/de-dup, error reporting
+  web.py                     # aiohttp side-car: /healthz /readyz /metrics + webhook receiver
   handlers/
     common.py                # /start /help /mystatus /id
     admin.py                 # admin commands
@@ -168,12 +204,15 @@ bot/
   services/
     database.py              # aiosqlite persistence layer
     membership.py            # business logic (track, remove, extend, cards)
-    scheduler.py             # APScheduler jobs: expiry, reminders, prompt timeouts, maintenance
+    scheduler.py             # APScheduler jobs: expiry, reminders, prompt timeouts, housekeeping, maintenance
+    metrics.py               # counters / gauges / latency + Prometheus exposition
   utils/
     timeparse.py             # durations & dates parsing
     keyboards.py             # inline keyboards
     permissions.py           # admin checks
-tests/                       # pytest suite (49 tests)
+    cache.py                 # TTL + LRU cache for hot read paths
+    telegram.py              # tg_call / tg_try: retries for flood limits & network blips
+tests/                       # pytest suite (64 tests)
 ```
 
 Run tests: `python -m pytest -q`

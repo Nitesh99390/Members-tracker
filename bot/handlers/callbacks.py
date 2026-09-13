@@ -42,6 +42,7 @@ from bot.utils.keyboards import (
     settings_keyboard,
 )
 from bot.utils.permissions import is_admin
+from bot.utils.telegram import is_not_modified, tg_call
 from bot.utils.timeparse import ParseError, describe_duration, format_dt, humanize_delta
 
 log = logging.getLogger(__name__)
@@ -57,13 +58,31 @@ class CustomInput(StatesGroup):
 
 # ------------------------------------------------------------------ helpers
 async def _edit(call: CallbackQuery, text: str, markup=None) -> None:
+    """Edit the message behind a button, tolerating no-op edits and stale messages."""
     if call.message is None:
         return
     try:
-        await call.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+        await tg_call(
+            call.message.edit_text,
+            text,
+            reply_markup=markup,
+            disable_web_page_preview=True,
+            retries=1,
+            label="edit_text",
+        )
     except TelegramBadRequest as exc:
-        if "message is not modified" not in str(exc):
-            log.debug("edit failed: %s", exc)
+        if is_not_modified(exc):
+            return
+        # message too old to edit (48h) or deleted → send a fresh one instead
+        if "can't be edited" in str(exc) or "message to edit not found" in str(exc).lower():
+            try:
+                await call.message.answer(text, reply_markup=markup, disable_web_page_preview=True)
+            except Exception as inner:  # noqa: BLE001
+                log.debug("fallback send failed: %s", inner)
+            return
+        log.debug("edit failed: %s", exc)
+    except Exception as exc:  # noqa: BLE001 - network blips must never break a button
+        log.debug("edit failed: %s", exc)
 
 
 async def _authorised(
