@@ -14,9 +14,10 @@ from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 
+from bot import VERSION_TAG
 from bot.config import Settings
 from bot.services.database import Database
-from bot.utils.keyboards import help_keyboard, home_keyboard, open_private_keyboard
+from bot.utils.keyboards import help_keyboard, home_keyboard, main_menu_keyboard, open_private_keyboard
 from bot.utils.timeparse import format_dt, humanize_delta
 
 router = Router(name="common")
@@ -25,7 +26,7 @@ BOT_NAME = "Member Tracker"
 
 HELP_TOPICS: dict[str, str] = {
     "main": (
-        f"<b>📖 {BOT_NAME} — Help</b>\n\n"
+        f"<b>📖 {BOT_NAME} — Help</b> <code>{VERSION_TAG}</code>\n\n"
         "I keep track of how long each member may stay in your groups and channels, "
         "and remove them automatically when their time is up.\n\n"
         "Pick a topic:"
@@ -75,7 +76,8 @@ HELP_TOPICS: dict[str, str] = {
         "<code>/setwelcome text</code> · <code>/setlog here</code> · <code>/broadcast text</code>\n"
         "<code>/sync</code> · <code>/forcecheck</code> · <code>/permissions</code>\n\n"
         "<b>Durations</b>: <code>30d</code> <code>2w</code> <code>1m</code> <code>1y</code> <code>1m 15d</code> <code>never</code>\n"
-        "<b>Dates</b>: <code>2025-12-31</code> · <code>31/12/2025 18:30</code>"
+        "<b>Dates</b>: <code>2025-12-31</code> · <code>31/12/2025 18:30</code>\n\n"
+        "<i>Tip: the bottom menu is always one tap away — use it to jump to any screen.</i>"
     ),
 }
 
@@ -90,18 +92,20 @@ async def _is_admin_user(db: Database, settings: Settings, user_id: int) -> tupl
 
 def home_text(first_name: str, is_admin: bool, has_chats: bool) -> str:
     name = escape(first_name)
+    tag = f"<code>{VERSION_TAG}</code>"
     if is_admin and has_chats:
         return (
-            f"<b>👋 Welcome back, {name}</b>\n\n"
-            "Choose a chat to see its members, pending decisions and settings."
+            f"<b>👋 Welcome back, {name}</b> · {tag}\n\n"
+            "Choose a chat to see its members, pending decisions and settings.\n"
+            "<i>Use the bottom menu to jump anywhere in one tap.</i>"
         )
     if is_admin:
         return (
-            f"<b>👋 Hello {name}</b>\n\n"
+            f"<b>👋 Hello {name}</b> · {tag}\n\n"
             "Add me to a group or channel as admin and it will show up here."
         )
     return (
-        f"<b>👋 Hello {name}</b>\n\n"
+        f"<b>👋 Hello {name}</b> · {tag}\n\n"
         f"I'm {BOT_NAME}. I manage time-limited memberships for groups and channels.\n"
         "Admins: add me to your chat to get started."
     )
@@ -112,6 +116,12 @@ async def cmd_start(message: Message, bot: Bot, db: Database, settings: Settings
     user = message.from_user
     is_admin, has_chats = await _is_admin_user(db, settings, user.id)
     me = await bot.me()
+    # Telegram allows one keyboard per message: the greeting carries the persistent
+    # bottom menu (installed/refreshed on every /start), the inline quick actions follow.
+    await message.answer(
+        home_text(user.first_name, is_admin, has_chats),
+        reply_markup=main_menu_keyboard(is_admin, has_chats),
+    )
     if is_admin and has_chats and (message.text or "").strip().endswith(" menu"):
         # deep link from a group ("Open dashboard") → jump straight to the chat list
         from bot.handlers.admin import cmd_chats  # local import avoids a cycle
@@ -119,7 +129,7 @@ async def cmd_start(message: Message, bot: Bot, db: Database, settings: Settings
         await cmd_chats(message, bot, db, settings)
         return
     await message.answer(
-        home_text(user.first_name, is_admin, has_chats),
+        "⚡ <b>Quick actions</b>",
         reply_markup=home_keyboard(is_admin, me.username or "", has_chats),
     )
 

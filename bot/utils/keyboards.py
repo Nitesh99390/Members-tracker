@@ -7,8 +7,14 @@ Design rules (keep the bot feeling clean and professional):
 """
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 from bot.services.database import Chat, InviteLink
 
@@ -49,6 +55,92 @@ def preset_label(value: str) -> str:
 def quick_durations(exclude: str | None, count: int = 3) -> list[str]:
     out = [v for v in QUICK_DURATIONS if v != exclude]
     return out[:count]
+
+
+# ------------------------------------------------------------ reply keyboard
+# Persistent bottom menu shown in the private chat. It mirrors the most used
+# inline actions so an admin can reach any screen with a single tap, even when
+# the last inline message has scrolled away.
+#
+# Button labels double as the routing key (Telegram sends them back as plain
+# text), so keep them unique and stable. ``MENU_*`` constants are the single
+# source of truth for both the keyboard and the message handler.
+MENU_CHATS = "📂 My chats"
+MENU_DASHBOARD = "📊 Dashboard"
+MENU_MEMBERS = "👥 Members"
+MENU_PENDING = "🔔 Pending"
+MENU_INVITES = "🔗 Invite links"
+MENU_SETTINGS = "⚙️ Settings"
+MENU_HELP = "📖 Help"
+MENU_STATUS = "📇 My memberships"
+MENU_ADD = "➕ Add to group"
+
+#: Every label the reply-keyboard router must react to.
+MENU_BUTTONS: frozenset[str] = frozenset(
+    {
+        MENU_CHATS,
+        MENU_DASHBOARD,
+        MENU_MEMBERS,
+        MENU_PENDING,
+        MENU_INVITES,
+        MENU_SETTINGS,
+        MENU_HELP,
+        MENU_STATUS,
+        MENU_ADD,
+    }
+)
+
+
+def _kbtn(text: str) -> KeyboardButton:
+    return KeyboardButton(text=text)
+
+
+def main_menu_keyboard(is_admin: bool, has_chats: bool) -> ReplyKeyboardMarkup:
+    """Persistent bottom menu for the private chat.
+
+    * regular user   → My memberships · Help
+    * admin, no chat → Add to group · Help
+    * admin + chats  → Dashboard / Members / Pending / Invite links / Settings / My chats / Help
+    """
+    kb = ReplyKeyboardBuilder()
+    if is_admin and has_chats:
+        kb.row(_kbtn(MENU_DASHBOARD), _kbtn(MENU_MEMBERS))
+        kb.row(_kbtn(MENU_PENDING), _kbtn(MENU_INVITES))
+        kb.row(_kbtn(MENU_SETTINGS), _kbtn(MENU_CHATS))
+        kb.row(_kbtn(MENU_HELP))
+        placeholder = "Pick an action or send a user ID / @username"
+    elif is_admin:
+        kb.row(_kbtn(MENU_ADD), _kbtn(MENU_HELP))
+        placeholder = "Add me to a group to get started"
+    else:
+        kb.row(_kbtn(MENU_STATUS), _kbtn(MENU_HELP))
+        placeholder = "Pick an action"
+    return kb.as_markup(resize_keyboard=True, is_persistent=True, input_field_placeholder=placeholder)
+
+
+def remove_reply_keyboard() -> ReplyKeyboardRemove:
+    """Hide the bottom menu (e.g. when a user is no longer an admin anywhere)."""
+    return ReplyKeyboardRemove(remove_keyboard=True)
+
+
+def menu_key(text: str | None) -> str | None:
+    """Normalise a tapped reply-button label to its ``MENU_*`` constant.
+
+    Tolerates stray whitespace. Returns ``None`` for anything that is not a
+    menu button so ordinary text (IDs, @usernames, custom durations) passes
+    through untouched.
+    """
+    if not text:
+        return None
+    label = " ".join(text.split())
+    return label if label in MENU_BUTTONS else None
+
+
+def add_to_group_keyboard(bot_username: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(_url("➕ Add to a group", f"https://t.me/{bot_username}?startgroup=true&admin=restrict_members+invite_users"))
+    kb.row(_url("📢 Add to a channel", f"https://t.me/{bot_username}?startchannel=true&admin=restrict_members+invite_users"))
+    return kb.as_markup()
 
 
 # ------------------------------------------------------------------ home / help

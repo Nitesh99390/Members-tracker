@@ -22,6 +22,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, Message, TelegramObject, Update
 
 from bot.services.metrics import Metrics
+from bot.utils.keyboards import menu_key
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +72,7 @@ class ThrottlingMiddleware(BaseMiddleware):
 
     A user may perform ``burst`` actions freely; after that, actions closer
     together than ``rate`` seconds are dropped with a short notice.
+    Reply-keyboard taps (plain-text menu labels) count as commands.
     Service messages (joins/leaves) are never throttled.
     """
 
@@ -97,7 +99,7 @@ class ThrottlingMiddleware(BaseMiddleware):
         is_command = False
         if isinstance(event, Message):
             user = event.from_user
-            is_command = bool(event.text and event.text.startswith("/"))
+            is_command = bool(event.text and (event.text.startswith("/") or menu_key(event.text)))
         elif isinstance(event, CallbackQuery):
             user = event.from_user
             is_command = True
