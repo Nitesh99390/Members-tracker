@@ -27,41 +27,23 @@ from bot.services.scheduler import ExpiryScheduler
 
 log = logging.getLogger("main")
 
+# Keep the "/" menu short: everything else is reachable through buttons.
 PRIVATE_COMMANDS = [
-    BotCommand(command="start", description="Start / help"),
-    BotCommand(command="chats", description="Select a chat to manage"),
-    BotCommand(command="panel", description="Settings panel for selected chat"),
+    BotCommand(command="start", description="Home"),
+    BotCommand(command="chats", description="Manage a group or channel"),
     BotCommand(command="pending", description="Joins waiting for your decision"),
-    BotCommand(command="stats", description="Membership statistics"),
-    BotCommand(command="list", description="Active members"),
-    BotCommand(command="expiring", description="Members expiring soon"),
-    BotCommand(command="info", description="Member details"),
-    BotCommand(command="add", description="Track a member manually"),
-    BotCommand(command="extend", description="Extend a membership"),
-    BotCommand(command="setexpiry", description="Set exact expiry date"),
-    BotCommand(command="remove", description="Remove a member now"),
-    BotCommand(command="invite", description="Create invite link with preset duration"),
-    BotCommand(command="invites", description="Manage invite links"),
-    BotCommand(command="whitelist", description="Never auto-remove a user"),
-    BotCommand(command="mystatus", description="Your memberships"),
-    BotCommand(command="help", description="Full command list"),
+    BotCommand(command="help", description="Help"),
 ]
 
 GROUP_COMMANDS = [
-    BotCommand(command="panel", description="Settings panel"),
-    BotCommand(command="stats", description="Membership statistics"),
-    BotCommand(command="list", description="Active members"),
     BotCommand(command="info", description="Member details (reply)"),
     BotCommand(command="extend", description="Extend membership (reply)"),
-    BotCommand(command="ask", description="Ask owner about member (reply)"),
     BotCommand(command="remove", description="Remove member (reply)"),
     BotCommand(command="mystatus", description="Your membership"),
-    BotCommand(command="id", description="Show IDs"),
 ]
 
 SUPER_ADMIN_EXTRA = [
     BotCommand(command="gstats", description="Global statistics"),
-    BotCommand(command="backup", description="Download database backup"),
     BotCommand(command="health", description="Bot health check"),
 ]
 
