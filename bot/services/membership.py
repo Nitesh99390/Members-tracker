@@ -233,7 +233,7 @@ class MembershipService:
             chat.chat_id, member.user_id, member.full_name, member.username, source=source
         )
         text = self.join_prompt_text(chat, pending, member)
-        kb = join_prompt_keyboard(pending.id)
+        kb = join_prompt_keyboard(pending.id, self.effective_duration(chat), source == "request")
         delivered = 0
         for admin_id in recipients:
             msg = await self.safe_send(admin_id, text, reply_markup=kb)
@@ -259,16 +259,16 @@ class MembershipService:
             "request": "requested to join",
             "manual": "was added",
         }.get(pending.source, "joined")
-        uname = f" (@{escape(pending.username)})" if pending.username else ""
+        uname = f" · @{escape(pending.username)}" if pending.username else ""
+        title = "Join request" if pending.source == "request" else f"New member {src}"
         return (
-            f"🔔 <b>New member {src}</b>\n\n"
+            f"🔔 <b>{title}</b>\n\n"
             f"👤 {pending.mention_html}{uname}\n"
             f"🆔 <code>{pending.user_id}</code>\n"
-            f"{icon} <b>{escape(chat.display)}</b>\n\n"
-            f"⏳ Default: <b>{default_label}</b> → until <b>{current}</b>\n\n"
-            f"<b>How long should this member stay?</b>\n"
-            f"Tap a button, or use <b>Custom</b> for any duration / date.\n"
-            f"<i>If you don't answer within {self.settings.ask_timeout_hours}h the default is kept.</i>"
+            f"{icon} {escape(chat.display)}\n\n"
+            f"How long may they stay?\n"
+            f"<i>Default <b>{default_label}</b> (until {current}) is kept if you don't answer within "
+            f"{self.settings.ask_timeout_hours}h.</i>"
         )
 
     async def apply_join_decision(

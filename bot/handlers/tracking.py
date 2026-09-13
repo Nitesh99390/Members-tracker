@@ -12,7 +12,7 @@ from aiogram.types import ChatJoinRequest, ChatMemberUpdated, Message
 from bot.config import Settings
 from bot.services.database import Database
 from bot.services.membership import MembershipService
-from bot.utils.keyboards import join_prompt_keyboard
+from bot.utils.keyboards import dashboard_keyboard, join_prompt_keyboard, open_private_keyboard
 from bot.utils.permissions import refresh_chat_admins
 from bot.utils.timeparse import describe_duration, format_dt
 
@@ -61,26 +61,28 @@ async def on_bot_membership(
         problems.append("Optional: <b>Invite users via link</b> lets me create duration-bound invite links.")
 
     text = (
-        f"✅ <b>Now tracking {escape(record.display)}</b>\n"
-        f"Type: {chat.type} • Default duration: <b>{describe_duration(service.effective_duration(record))}</b>\n"
-        f"🔔 Ask on join: <b>{'ON' if service.ask_enabled(record) else 'OFF'}</b>"
+        f"✅ <b>Now tracking {escape(record.display)}</b>\n\n"
+        f"⏳ New members stay <b>{describe_duration(service.effective_duration(record))}</b> by default"
+        + (" — you'll get a one-tap prompt on every join." if service.ask_enabled(record) else ".")
         + ("\n\n⚠️ " + "\n⚠️ ".join(problems) if problems else "")
-        + "\n\nManage it from my private chat with /panel."
     )
+    pending = await db.count_pending(chat.id)
+    dm_markup = dashboard_keyboard(record, pending)
 
     # Notify the admin who added the bot privately (works for channels too)
     notified: set[int] = set()
     if actor_id:
         await db.set_context(actor_id, chat.id)
-        if await service.dm_user(actor_id, text):
+        if await service.dm_user(actor_id, text, reply_markup=dm_markup):
             notified.add(actor_id)
     if owner_id and owner_id not in notified:
         await db.set_context(owner_id, chat.id)
-        if await service.dm_user(owner_id, text):
+        if await service.dm_user(owner_id, text, reply_markup=dm_markup):
             notified.add(owner_id)
     if not notified and chat.type != ChatType.CHANNEL:
-        # nobody reachable in private → post once in the group
-        await service.safe_send(chat.id, text)
+        # nobody reachable in private → post once in the group with a button to the DM
+        me = await bot.me()
+        await service.safe_send(chat.id, text, reply_markup=open_private_keyboard(me.username or ""))
     log.info(
         "Tracking %s (%s) owner=%s admins=%d notified=%s",
         record.display, chat.id, owner_id, len(admin_ids), sorted(notified),
@@ -194,18 +196,18 @@ async def on_join_request(
     pending = await db.create_pending(
         chat_rec.chat_id, user.id, user.full_name, user.username, source="request"
     )
-    uname = f" (@{escape(user.username)})" if user.username else ""
-    bio = f"\n💬 Bio: <i>{escape(event.bio)}</i>" if getattr(event, "bio", None) else ""
+    uname = f" · @{escape(user.username)}" if user.username else ""
+    bio = f"\n💬 <i>{escape(event.bio)}</i>" if getattr(event, "bio", None) else ""
     text = (
         f"🙋 <b>Join request</b>\n\n"
         f"👤 {pending.mention_html}{uname}\n🆔 <code>{user.id}</code>{bio}\n"
-        f"📍 <b>{escape(chat_rec.display)}</b>\n\n"
-        f"Approve and choose how long they may stay, or reject.\n"
+        f"📍 {escape(chat_rec.display)}\n\n"
+        f"Approve with a duration, or reject.\n"
         f"<i>Default: {describe_duration(service.effective_duration(chat_rec))}</i>"
     )
     delivered = 0
     for admin_id in recipients:
-        msg = await service.safe_send(admin_id, text, reply_markup=join_prompt_keyboard(pending.id))
+        msg = await service.safe_send(admin_id, text, reply_markup=join_prompt_keyboard(pending.id, service.effective_duration(chat_rec), True))
         if msg:
             delivered += 1
             await db.add_prompt_message(pending.id, admin_id, msg.message_id)
