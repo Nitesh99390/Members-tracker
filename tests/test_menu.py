@@ -147,7 +147,7 @@ async def test_context_is_respected_for_members_pending_invites_settings(env):
     await db.upsert_chat(-200, "B", "supergroup", None, added_by=1)
     await db.set_context(1, -200)
     for handler, needle in (
-        (menu.menu_members, "Members — B"),
+        (menu.menu_members, "Active members — B"),
         (menu.menu_pending, "Pending — B"),
         (menu.menu_invites, "Invite links — B"),
         (menu.menu_settings, "Settings — B"),

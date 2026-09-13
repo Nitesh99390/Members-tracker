@@ -1,4 +1,19 @@
-"""Inline button callbacks: home, dashboard, settings, member cards, join prompts, invite links."""
+"""Inline button callbacks: home, dashboard, settings, members, join prompts, invite links, tools.
+
+Callback-data grammar (``prefix:chat_id[:...]``) — every screen is reachable by
+tapping, typing is only needed for free-form values (custom dates, texts):
+
+===========  ======================================================
+``dash``     dashboard · ``settings`` · ``adv`` · ``tools`` · ``stats``
+``list``     ``list:<cid>:<view>:<page>`` tappable member list
+``member``   ``member:<cid>:<uid>[:<view>:<page>]`` member card
+``ext``/``cust``/``more``/``hist``/``note``/``askm``/``wl``/``kick``/``untrack``
+``set``/``dur``/``edit``/``editclr``/``editlog`` settings & editors
+``pending``/``pall``/``pallc``/``jd``/``jm``/``jr``/``jb``/``jc`` join prompts
+``invites``/``inpick``/``inew``/``incust``/``irev``/``irevc`` invite links
+``addm``/``search``/``bcast``/``bcastc``/``vips``/``sync``/``fcheck``/``perms`` tools
+===========  ======================================================
+"""
 from __future__ import annotations
 
 import logging
@@ -8,56 +23,51 @@ from html import escape
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot.config import Settings
-from bot.handlers.admin import dashboard_text, list_text, logs_text, settings_text, stats_text
+from bot.handlers import screens as S
 from bot.handlers.common import HELP_TOPICS, home_text, mystatus_text
 from bot.services.database import Chat, Database
 from bot.services.membership import MembershipService
-from bot.utils.keyboards import (
-    advanced_keyboard,
-    back_keyboard,
-    cancel_keyboard,
-    chats_keyboard,
-    confirm_keyboard,
-    dashboard_keyboard,
-    duration_keyboard,
-    help_keyboard,
-    home_keyboard,
-    invite_pick_keyboard,
-    invites_keyboard,
-    join_more_keyboard,
-    join_prompt_keyboard,
-    join_remove_confirm_keyboard,
-    list_keyboard,
-    member_keyboard,
-    member_more_keyboard,
-    pending_keyboard,
-    preset_label,
-    settings_keyboard,
-)
-from bot.utils.permissions import is_admin
+from bot.services.scheduler import ExpiryScheduler
+from bot.utils import keyboards as K
+from bot.utils.permissions import bot_can_restrict, is_admin
 from bot.utils.telegram import is_not_modified, tg_call
-from bot.utils.timeparse import ParseError, describe_duration, format_dt, humanize_delta
+from bot.utils.timeparse import ParseError, describe_duration, format_dt, is_permanent, parse_duration
+from bot.utils.ui import progress_bar
 
 log = logging.getLogger(__name__)
 router = Router(name="callbacks")
 
 
 class CustomInput(StatesGroup):
-    """Waiting for the admin to type a custom duration / date."""
+    """Waiting for the admin to type a free-form value."""
 
-    join_duration = State()  # data: pending_id, prompt_message_id
-    member_expiry = State()  # data: chat_id, user_id, prompt_message_id
+    join_duration = State()  # data: pending_id
+    member_expiry = State()  # data: chat_id, user_id
+    member_note = State()  # data: chat_id, user_id
+    add_member = State()  # data: chat_id
+    search = State()  # data: chat_id
+    broadcast = State()  # data: chat_id, text (after first message)
+    welcome_text = State()  # data: chat_id
+    log_chat = State()  # data: chat_id
+    chat_duration = State()  # data: chat_id
+    invite_custom = State()  # data: chat_id
+
+
+INPUT_HINT = (
+    "<code>45d</code> · <code>1m 15d</code> · <code>2025-12-31</code> · "
+    "<code>31/12/2025 18:30</code> · <code>never</code>"
+)
 
 
 # ------------------------------------------------------------------ helpers
-async def _edit(call: CallbackQuery, text: str, markup=None) -> None:
+async def _edit(call: CallbackQuery, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
     """Edit the message behind a button, tolerating no-op edits and stale messages."""
     if call.message is None:
         return
@@ -85,6 +95,10 @@ async def _edit(call: CallbackQuery, text: str, markup=None) -> None:
         log.debug("edit failed: %s", exc)
 
 
+async def _show(call: CallbackQuery, screen: S.Screen) -> None:
+    await _edit(call, *screen)
+
+
 async def _authorised(
     call: CallbackQuery, bot: Bot, db: Database, settings: Settings, chat_id: int
 ) -> Chat | None:
@@ -98,31 +112,6 @@ async def _authorised(
     return chat
 
 
-def _settings_markup(chat: Chat, settings: Settings):
-    return settings_keyboard(chat, settings.default_duration, settings.ask_on_join_default)
-
-
-async def _show_dashboard(call: CallbackQuery, db: Database, settings: Settings, chat: Chat) -> None:
-    pending = await db.count_pending(chat.chat_id)
-    await _edit(call, await dashboard_text(db, chat, settings), dashboard_keyboard(chat, pending))
-
-
-async def _show_settings(call: CallbackQuery, db: Database, settings: Settings, chat_id: int) -> None:
-    chat = await db.get_chat(chat_id)
-    if chat:
-        await _edit(call, settings_text(chat, settings), _settings_markup(chat, settings))
-
-
-async def _show_member(
-    call: CallbackQuery, db: Database, service: MembershipService, chat: Chat, uid: int
-) -> None:
-    member = await db.get_member(chat.chat_id, uid)
-    if not member:
-        await call.answer("Member is not tracked.", show_alert=True)
-        return
-    await _edit(call, service.member_card(chat, member), member_keyboard(chat.chat_id, uid, member.is_active))
-
-
 def _ids(data: str, count: int) -> list[str]:
     parts = data.split(":")
     if len(parts) < count + 1:
@@ -130,10 +119,70 @@ def _ids(data: str, count: int) -> list[str]:
     return parts[1 : count + 1]
 
 
+def _parts(data: str) -> list[str]:
+    return data.split(":")[1:]
+
+
 async def _admin_chats(db: Database, settings: Settings, user_id: int) -> list[Chat]:
     if user_id in settings.super_admins:
         return await db.list_chats()
     return await db.chats_for_admin(user_id)
+
+
+async def _show_dashboard(call: CallbackQuery, db: Database, settings: Settings, chat: Chat) -> None:
+    many = len(await _admin_chats(db, settings, call.from_user.id)) > 1
+    await _show(call, await S.dashboard_screen(db, chat, settings, many))
+
+
+async def _show_member(
+    call: CallbackQuery,
+    db: Database,
+    service: MembershipService,
+    chat: Chat,
+    uid: int,
+    back_view: str = "active",
+    back_page: int = 0,
+) -> bool:
+    member = await db.get_member(chat.chat_id, uid)
+    if not member:
+        await call.answer("Member is not tracked.", show_alert=True)
+        return False
+    await _edit(
+        call,
+        service.member_card(chat, member),
+        K.member_keyboard(chat.chat_id, uid, member.is_active, back_view, back_page),
+    )
+    return True
+
+
+def _private_only(call: CallbackQuery) -> bool:
+    return call.message is not None and call.message.chat.type == ChatType.PRIVATE
+
+
+async def _begin_input(
+    call: CallbackQuery, state: FSMContext, st: State, text: str, cancel_to: str, **data: object
+) -> None:
+    """Switch to an FSM input state and show the instruction with a cancel button."""
+    if not _private_only(call):
+        await call.answer("Use this from my private chat.", show_alert=True)
+        return
+    await state.set_state(st)
+    await state.update_data(prompt_message_id=call.message.message_id if call.message else None, **data)
+    await _edit(call, text, K.cancel_keyboard(cancel_to))
+    await call.answer()
+
+
+async def _input_chat(
+    message: Message, bot: Bot, db: Database, settings: Settings, state: FSMContext
+) -> Chat | None:
+    """Resolve + authorise the chat stored in FSM data; clears state on failure."""
+    data = await state.get_data()
+    chat_id = int(data.get("chat_id", 0))
+    chat = await db.get_chat(chat_id)
+    if not chat or not await is_admin(bot, db, settings, chat_id, message.from_user.id):
+        await state.clear()
+        return None
+    return chat
 
 
 # ------------------------------------------------------------- home / help
@@ -146,7 +195,7 @@ async def cb_home(call: CallbackQuery, bot: Bot, db: Database, settings: Setting
     await _edit(
         call,
         home_text(call.from_user.first_name, is_admin_user, bool(chats)),
-        home_keyboard(is_admin_user, me.username or "", bool(chats)),
+        K.home_keyboard(is_admin_user, me.username or "", bool(chats)),
     )
     await call.answer()
 
@@ -155,14 +204,13 @@ async def cb_home(call: CallbackQuery, bot: Bot, db: Database, settings: Setting
 async def cb_help(call: CallbackQuery) -> None:
     topic = _ids(call.data, 1)[0]
     text = HELP_TOPICS.get(topic) or HELP_TOPICS["main"]
-    await _edit(call, text, help_keyboard(topic if topic in HELP_TOPICS else "main"))
+    await _edit(call, text, K.help_keyboard(topic if topic in HELP_TOPICS else "main"))
     await call.answer()
 
 
 @router.callback_query(F.data == "mystatus")
 async def cb_mystatus(call: CallbackQuery, db: Database, settings: Settings) -> None:
-    kb = help_keyboard("x")  # "back to help / home" pair
-    await _edit(call, await mystatus_text(db, settings, call.from_user.id), kb)
+    await _edit(call, await mystatus_text(db, settings, call.from_user.id), K.mystatus_keyboard())
     await call.answer()
 
 
@@ -174,7 +222,7 @@ async def cb_chats(call: CallbackQuery, db: Database, settings: Settings, state:
         await call.answer("No chats yet — add me to a group as admin.", show_alert=True)
         return
     current = await db.get_context(call.from_user.id)
-    await _edit(call, "📂 <b>Your chats</b>\nChoose one to manage:", chats_keyboard(chats, current))
+    await _show(call, await S.chats_screen(db, chats, current))
     await call.answer()
 
 
@@ -205,31 +253,30 @@ async def cb_settings(call: CallbackQuery, bot: Bot, db: Database, settings: Set
     if not chat:
         return
     await state.clear()
-    await _edit(call, settings_text(chat, settings), _settings_markup(chat, settings))
+    await _show(call, S.settings_screen(chat, settings))
     await call.answer()
 
 
 @router.callback_query(F.data.startswith("adv:"))
-async def cb_advanced(call: CallbackQuery, bot: Bot, db: Database, settings: Settings) -> None:
+async def cb_advanced(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
     chat_id = int(_ids(call.data, 1)[0])
     chat = await _authorised(call, bot, db, settings, chat_id)
     if not chat:
         return
-    await _edit(call, _advanced_text(chat), advanced_keyboard(chat))
+    await state.clear()
+    await _show(call, S.advanced_screen(chat))
     await call.answer()
 
 
-def _advanced_text(chat: Chat) -> str:
-    log_line = f"<code>{chat.log_chat_id}</code>" if chat.log_chat_id else "off · <code>/setlog here</code>"
-    welcome = "custom" if chat.welcome_text else "default text · <code>/setwelcome …</code>"
-    return (
-        f"🔧 <b>Advanced — {escape(chat.display)}</b>\n\n"
-        f"• <b>DM members</b>: expiry reminders and confirmations by private message\n"
-        f"• <b>Welcome</b>: greet new members ({welcome})\n"
-        f"• <b>Join requests</b>: ignore, auto-approve, or ask you with a duration\n"
-        f"• <b>Prompts</b>: who receives the join prompts\n\n"
-        f"📨 Log channel: {log_line}"
-    )
+@router.callback_query(F.data.startswith("tools:"))
+async def cb_tools(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
+    chat_id = int(_ids(call.data, 1)[0])
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    await state.clear()
+    await _show(call, S.tools_screen(chat))
+    await call.answer()
 
 
 # ------------------------------------------------------------------ toggles
@@ -243,16 +290,7 @@ async def cb_toggle(
     if not chat:
         return
     if key == "duration":
-        current = chat.default_duration or settings.default_duration
-        await _edit(
-            call,
-            f"⏳ <b>Default duration — {escape(chat.display)}</b>\n\n"
-            f"Currently <b>{escape(describe_duration(current))}</b>"
-            + (" (global default)" if not chat.default_duration else "")
-            + ".\n\nNew members get this unless you pick something else on their join prompt.\n"
-            "<i>Any other value: <code>/setduration 45d</code></i>",
-            duration_keyboard(chat_id),
-        )
+        await _show(call, S.duration_screen(chat, settings))
         await call.answer()
         return
 
@@ -270,8 +308,10 @@ async def cb_toggle(
         note = "Auto-remove on" if updates["auto_kick"] else "Auto-remove off"
     elif key == "notify":
         updates["notify_user"] = int(not chat.notify_user)
+        note = "Members get DMs" if updates["notify_user"] else "Members are not DM'd"
     elif key == "welcome":
         updates["welcome_enabled"] = int(not chat.welcome_enabled)
+        note = "Welcome message on" if updates["welcome_enabled"] else "Welcome message off"
     elif key == "ask":
         updates["ask_on_join"] = int(not service.ask_enabled(chat))
         note = "You'll be asked on every join" if updates["ask_on_join"] else "Default applied silently"
@@ -290,24 +330,87 @@ async def cb_toggle(
     await db.update_chat(chat_id, **updates)
     await db.add_log(chat_id, None, f"toggle_{key}", str(list(updates.values())[0]), call.from_user.id)
     chat = await db.get_chat(chat_id)
-    if advanced:
-        await _edit(call, _advanced_text(chat), advanced_keyboard(chat))
-    else:
-        await _edit(call, settings_text(chat, settings), _settings_markup(chat, settings))
+    await _show(call, S.advanced_screen(chat) if advanced else S.settings_screen(chat, settings))
     await call.answer(note)
 
 
 @router.callback_query(F.data.startswith("dur:"))
-async def cb_duration(call: CallbackQuery, bot: Bot, db: Database, settings: Settings) -> None:
+async def cb_duration(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
     chat_id_s, value = _ids(call.data, 2)
     chat_id = int(chat_id_s)
     chat = await _authorised(call, bot, db, settings, chat_id)
     if not chat:
         return
+    if value == "custom":
+        await _begin_input(
+            call,
+            state,
+            CustomInput.chat_duration,
+            f"✏️ <b>Custom default duration — {escape(chat.display)}</b>\n\n"
+            "Send a duration such as <code>45d</code>, <code>2w</code>, <code>1m 15d</code> or <code>never</code>.",
+            f"set:{chat_id}:duration",
+            chat_id=chat_id,
+        )
+        return
     await db.update_chat(chat_id, default_duration=None if value == "global" else value)
     await db.add_log(chat_id, None, "set_duration", value, call.from_user.id)
-    await _show_settings(call, db, settings, chat_id)
+    chat = await db.get_chat(chat_id)
+    await _show(call, S.settings_screen(chat, settings))
     await call.answer(f"Default: {describe_duration(settings.default_duration if value == 'global' else value)}")
+
+
+# ---------------------------------------------------------- text editors
+@router.callback_query(F.data.startswith("edit:"))
+async def cb_edit(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
+    chat_id_s, kind = _ids(call.data, 2)
+    chat_id = int(chat_id_s)
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    if kind not in ("welcome", "log"):
+        await call.answer("Unknown editor")
+        return
+    if not _private_only(call):
+        await call.answer("Use this from my private chat.", show_alert=True)
+        return
+    await state.set_state(CustomInput.welcome_text if kind == "welcome" else CustomInput.log_chat)
+    await state.update_data(chat_id=chat_id)
+    await _show(call, S.edit_text_screen(chat, kind))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("editclr:"))
+async def cb_edit_clear(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
+    chat_id_s, kind = _ids(call.data, 2)
+    chat_id = int(chat_id_s)
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    await state.clear()
+    if kind == "welcome":
+        await db.update_chat(chat_id, welcome_text=None)
+        note = "Welcome text reset to default"
+    else:
+        await db.update_chat(chat_id, log_chat_id=None)
+        note = "Log channel disabled"
+    await db.add_log(chat_id, None, f"clear_{kind}", None, call.from_user.id)
+    chat = await db.get_chat(chat_id)
+    await _show(call, S.advanced_screen(chat))
+    await call.answer(note)
+
+
+@router.callback_query(F.data.startswith("editlog:"))
+async def cb_edit_log_here(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
+    chat_id = int(_ids(call.data, 1)[0])
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat or call.message is None:
+        return
+    await state.clear()
+    await db.update_chat(chat_id, log_chat_id=call.message.chat.id)
+    await db.add_log(chat_id, None, "set_log", str(call.message.chat.id), call.from_user.id)
+    chat = await db.get_chat(chat_id)
+    await _show(call, S.advanced_screen(chat))
+    await call.answer("Logs will be posted here")
 
 
 # ------------------------------------------------------------------- views
@@ -317,30 +420,46 @@ async def cb_stats(call: CallbackQuery, bot: Bot, db: Database, settings: Settin
     chat = await _authorised(call, bot, db, settings, chat_id)
     if not chat:
         return
-    await _edit(call, await stats_text(db, chat, settings), back_keyboard(chat_id))
+    await _show(call, await S.stats_screen(db, chat, settings))
     await call.answer()
 
 
 @router.callback_query(F.data.startswith("logs:"))
 async def cb_logs(call: CallbackQuery, bot: Bot, db: Database, settings: Settings) -> None:
-    chat_id = int(_ids(call.data, 1)[0])
+    parts = _parts(call.data)
+    chat_id = int(parts[0])
+    page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
     chat = await _authorised(call, bot, db, settings, chat_id)
     if not chat:
         return
-    await _edit(call, await logs_text(db, chat, settings), back_keyboard(chat_id))
+    await _show(call, await S.logs_screen(db, chat, settings, page))
     await call.answer()
+
+
+def _parse_list_data(data: str) -> tuple[int, str, int]:
+    """``list:<cid>:<view>:<page>`` — also accepts the legacy ``list:<cid>:<page>``."""
+    parts = _parts(data)
+    chat_id = int(parts[0])
+    view, page = "active", 0
+    if len(parts) == 2:
+        if parts[1].lstrip("-").isdigit():
+            page = int(parts[1])
+        else:
+            view = parts[1]
+    elif len(parts) >= 3:
+        view = parts[1]
+        page = int(parts[2]) if parts[2].lstrip("-").isdigit() else 0
+    return chat_id, view, max(0, page)
 
 
 @router.callback_query(F.data.startswith("list:"))
 async def cb_list(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
-    chat_id_s, page_s = _ids(call.data, 2)
-    chat_id, page = int(chat_id_s), int(page_s)
+    chat_id, view, page = _parse_list_data(call.data)
     chat = await _authorised(call, bot, db, settings, chat_id)
     if not chat:
         return
     await state.clear()
-    text, has_next = await list_text(db, chat, settings, page)
-    await _edit(call, text, list_keyboard(chat_id, page, has_next))
+    await _show(call, await S.members_screen(db, chat, settings, view, page))
     await call.answer()
 
 
@@ -349,13 +468,15 @@ async def cb_list(call: CallbackQuery, bot: Bot, db: Database, settings: Setting
 async def cb_member(
     call: CallbackQuery, bot: Bot, db: Database, settings: Settings, service: MembershipService, state: FSMContext
 ) -> None:
-    chat_id_s, uid_s = _ids(call.data, 2)
-    chat_id, uid = int(chat_id_s), int(uid_s)
+    parts = _parts(call.data)
+    chat_id, uid = int(parts[0]), int(parts[1])
+    view = parts[2] if len(parts) > 2 else "active"
+    page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
     chat = await _authorised(call, bot, db, settings, chat_id)
     if not chat:
         return
     await state.clear()
-    await _show_member(call, db, service, chat, uid)
+    await _show_member(call, db, service, chat, uid, view, page)
     await call.answer()
 
 
@@ -371,7 +492,7 @@ async def cb_member_more(call: CallbackQuery, bot: Bot, db: Database, settings: 
         await call.answer("Member is not tracked.", show_alert=True)
         return
     wl = await db.is_whitelisted(chat_id, uid)
-    await _edit(call, service.member_card(chat, member), member_more_keyboard(chat_id, uid, member.is_active, wl))
+    await _edit(call, service.member_card(chat, member), K.member_more_keyboard(chat_id, uid, member.is_active, wl))
     await call.answer()
 
 
@@ -408,20 +529,61 @@ async def cb_custom_expiry(
     chat = await _authorised(call, bot, db, settings, chat_id)
     if not chat:
         return
-    if call.message and call.message.chat.type != ChatType.PRIVATE:
-        await call.answer("Use this from my private chat.", show_alert=True)
-        return
-    await state.set_state(CustomInput.member_expiry)
-    await state.update_data(chat_id=chat_id, user_id=uid, prompt_message_id=call.message.message_id if call.message else None)
-    await _edit(
+    member = await db.get_member(chat_id, uid)
+    who = member.mention_html if member else f"<code>{uid}</code>"
+    await _begin_input(
         call,
-        f"✏️ <b>Custom expiry</b> · <code>{uid}</code>\n\n"
-        "Send a duration to add, or an exact date:\n"
-        "<code>45d</code> · <code>1m 15d</code> · <code>2025-12-31</code> · "
-        "<code>31/12/2025 18:30</code> · <code>never</code>",
-        cancel_keyboard(f"member:{chat_id}:{uid}"),
+        state,
+        CustomInput.member_expiry,
+        f"✏️ <b>Custom expiry for {who}</b>\n\nSend a duration to add, or an exact date:\n{INPUT_HINT}",
+        f"member:{chat_id}:{uid}",
+        chat_id=chat_id,
+        user_id=uid,
     )
-    await call.answer()
+
+
+@router.callback_query(F.data.startswith("note:"))
+async def cb_note(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
+    chat_id_s, uid_s = _ids(call.data, 2)
+    chat_id, uid = int(chat_id_s), int(uid_s)
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    member = await db.get_member(chat_id, uid)
+    if not member:
+        await call.answer("Member is not tracked.", show_alert=True)
+        return
+    current = f"\n\nCurrent: <i>{escape(member.note)}</i>" if member.note else ""
+    await _begin_input(
+        call,
+        state,
+        CustomInput.member_note,
+        f"📝 <b>Note for {member.mention_html}</b>{current}\n\n"
+        "Send the note text (e.g. a payment reference). Send <code>-</code> to clear it.",
+        f"member:{chat_id}:{uid}",
+        chat_id=chat_id,
+        user_id=uid,
+    )
+
+
+@router.callback_query(F.data.startswith("askm:"))
+async def cb_ask_member(
+    call: CallbackQuery, bot: Bot, db: Database, settings: Settings, service: MembershipService
+) -> None:
+    chat_id_s, uid_s = _ids(call.data, 2)
+    chat_id, uid = int(chat_id_s), int(uid_s)
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    member = await db.get_member(chat_id, uid)
+    if not member:
+        await call.answer("Member is not tracked.", show_alert=True)
+        return
+    pending = await service.ask_owner_about_member(chat, member, source="manual")
+    await call.answer(
+        "Prompt sent to the owner/admins" if pending else "Nobody could be reached — the owner must /start me first.",
+        show_alert=not pending,
+    )
 
 
 @router.callback_query(F.data.startswith("hist:"))
@@ -439,16 +601,8 @@ async def cb_history(call: CallbackQuery, bot: Bot, db: Database, settings: Sett
         ts = format_dt(datetime.fromisoformat(r["created_at"]), settings.tz)
         det = f" <i>{escape(str(r['details']))[:50]}</i>" if r["details"] else ""
         lines.append(f"• {ts} — <b>{escape(r['action'])}</b>{det}")
-    await _edit(call, "\n".join(lines), confirm_back(chat_id, uid))
+    await _edit(call, "\n".join(lines), K.cancel_keyboard(f"member:{chat_id}:{uid}", "◀️ Back"))
     await call.answer()
-
-
-def confirm_back(chat_id: int, uid: int):
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="◀️ Back", callback_data=f"member:{chat_id}:{uid}")]]
-    )
 
 
 @router.callback_query(F.data.startswith("kick:"))
@@ -460,7 +614,7 @@ async def cb_kick_confirm(call: CallbackQuery, bot: Bot, db: Database, settings:
         return
     member = await db.get_member(chat_id, uid)
     who = member.mention_html if member else f"<code>{uid}</code>"
-    await _edit(call, f"⚠️ Remove {who} from <b>{escape(chat.display)}</b> now?", confirm_keyboard("kick", chat_id, uid))
+    await _edit(call, f"⚠️ Remove {who} from <b>{escape(chat.display)}</b> now?", K.confirm_keyboard("kick", chat_id, uid))
     await call.answer()
 
 
@@ -492,7 +646,7 @@ async def cb_untrack_confirm(call: CallbackQuery, bot: Bot, db: Database, settin
     await _edit(
         call,
         f"🗑 Stop tracking <code>{uid}</code>?\n\n<i>They stay in the chat but will no longer expire.</i>",
-        confirm_keyboard("untrack", chat_id, uid),
+        K.confirm_keyboard("untrack", chat_id, uid),
     )
     await call.answer()
 
@@ -506,8 +660,7 @@ async def cb_untrack(call: CallbackQuery, bot: Bot, db: Database, settings: Sett
         return
     await db.delete_member(chat_id, uid)
     await db.add_log(chat_id, uid, "untrack", None, call.from_user.id)
-    text, has_next = await list_text(db, chat, settings, 0)
-    await _edit(call, text, list_keyboard(chat_id, 0, has_next))
+    await _show(call, await S.members_screen(db, chat, settings, "active", 0))
     await call.answer("Stopped tracking")
 
 
@@ -578,7 +731,7 @@ async def cb_join_more(call: CallbackQuery, bot: Bot, db: Database, settings: Se
         await call.answer("Already handled.", show_alert=True)
         return
     if call.message:
-        await call.message.edit_reply_markup(reply_markup=join_more_keyboard(pid))
+        await call.message.edit_reply_markup(reply_markup=K.join_more_keyboard(pid))
     await call.answer()
 
 
@@ -596,7 +749,7 @@ async def cb_join_remove_confirm(call: CallbackQuery, bot: Bot, db: Database, se
     await _edit(
         call,
         f"⚠️ <b>{verb} {pending.mention_html}</b> (<code>{pending.user_id}</code>) from {escape(chat.display)}?",
-        join_remove_confirm_keyboard(pid, is_req),
+        K.join_remove_confirm_keyboard(pid, is_req),
     )
     await call.answer()
 
@@ -618,7 +771,7 @@ async def cb_join_back(
     await _edit(
         call,
         service.join_prompt_text(chat, pending, member),
-        join_prompt_keyboard(pid, service.effective_duration(chat), pending.source == "request"),
+        K.join_prompt_keyboard(pid, service.effective_duration(chat), pending.source == "request"),
     )
     if call.message:
         await db.add_prompt_message(pid, call.from_user.id, call.message.message_id)
@@ -636,71 +789,78 @@ async def cb_join_custom(
     if pending.status != "pending":
         await call.answer("Already handled.", show_alert=True)
         return
-    await state.set_state(CustomInput.join_duration)
-    await state.update_data(pending_id=pid, prompt_message_id=call.message.message_id if call.message else None)
+    await _begin_input(
+        call,
+        state,
+        CustomInput.join_duration,
+        f"✏️ <b>Custom duration for {pending.mention_html}</b>\n\n"
+        f"Send how long they may stay, or an exact date:\n{INPUT_HINT}",
+        f"jb:{pid}",
+        pending_id=pid,
+    )
+
+
+@router.callback_query(F.data.startswith("pending:"))
+async def cb_pending(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
+    chat_id = int(_ids(call.data, 1)[0])
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    await state.clear()
+    await _show(call, await S.pending_screen(db, chat, settings))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("pall:"))
+async def cb_pending_all_confirm(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, service: MembershipService) -> None:
+    chat_id = int(_ids(call.data, 1)[0])
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    count = await db.count_pending(chat_id)
+    if not count:
+        await call.answer("Nothing pending.", show_alert=True)
+        return
+    label = describe_duration(service.effective_duration(chat))
     await _edit(
         call,
-        f"✏️ <b>Custom duration for {pending.mention_html}</b>\n\n"
-        "Send how long they may stay, or an exact date:\n"
-        "<code>45d</code> · <code>1m 15d</code> · <code>2025-12-31</code> · "
-        "<code>31/12/2025 18:30</code> · <code>never</code>",
-        cancel_keyboard(f"jb:{pid}"),
+        f"✅ <b>Apply the default to everyone waiting?</b>\n\n"
+        f"<b>{count}</b> member{'s' if count != 1 else ''} in {escape(chat.display)} will get "
+        f"<b>{escape(label)}</b>. Join requests are approved.",
+        K.pending_all_confirm_keyboard(chat_id, count),
     )
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("pending:"))
-async def cb_pending(call: CallbackQuery, bot: Bot, db: Database, settings: Settings) -> None:
+@router.callback_query(F.data.startswith("pallc:"))
+async def cb_pending_all(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, service: MembershipService) -> None:
     chat_id = int(_ids(call.data, 1)[0])
     chat = await _authorised(call, bot, db, settings, chat_id)
     if not chat:
         return
-    text, ids = await pending_text(db, chat, settings)
-    await _edit(call, text, pending_keyboard(chat_id, ids))
-    await call.answer()
-
-
-async def pending_text(db: Database, chat: Chat, settings: Settings) -> tuple[str, list[int]]:
-    items = await db.list_pending(chat.chat_id, limit=20)
-    lines = [f"🔔 <b>Pending — {escape(chat.display)}</b> · {len(items)}", ""]
-    if not items:
-        lines.append("<i>Nothing waiting. New joins will appear here until you answer their prompt.</i>")
-    else:
-        lines.append("<i>Tap a number to open the prompt.</i>")
-        lines.append("")
-    now = datetime.now(settings.tz)
+    items = await db.list_pending(chat_id, limit=200)
+    done = 0
     for p in items:
-        age = humanize_delta(now - p.created_at.astimezone(settings.tz))
-        kind = "requested" if p.source == "request" else "joined"
-        lines.append(f"<b>#{p.id}</b> {p.mention_html} · {kind} {age} ago")
-    return "\n".join(lines), [p.id for p in items]
+        if p.source == "request":
+            ok, _ = await service.apply_request_decision(p, "default", call.from_user.id, call.from_user.full_name)
+        else:
+            ok, _ = await service.apply_join_decision(p, "default", call.from_user.id, call.from_user.full_name)
+        done += int(ok)
+    await db.add_log(chat_id, None, "pending_bulk_default", f"{done}/{len(items)}", call.from_user.id)
+    await _show(call, await S.pending_screen(db, chat, settings))
+    await call.answer(f"Applied default to {done} of {len(items)}")
 
 
 # ------------------------------------------------------------ invite links
 @router.callback_query(F.data.startswith("invites:"))
-async def cb_invites(call: CallbackQuery, bot: Bot, db: Database, settings: Settings) -> None:
+async def cb_invites(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
     chat_id = int(_ids(call.data, 1)[0])
     chat = await _authorised(call, bot, db, settings, chat_id)
     if not chat:
         return
-    links = await db.list_invite_links(chat_id)
-    await _edit(call, invites_text(chat, links), invites_keyboard(chat, links))
+    await state.clear()
+    await _show(call, await S.invites_screen(db, chat))
     await call.answer()
-
-
-def invites_text(chat: Chat, links) -> str:
-    lines = [f"🔗 <b>Invite links — {escape(chat.display)}</b>", ""]
-    if not links:
-        lines.append(
-            "Anyone joining through a link gets its preset duration automatically — "
-            "no prompt, no manual work.\n\n<i>Tap ➕ New link to create one.</i>"
-        )
-    for link in links[:8]:
-        lines.append(
-            f"<b>{escape(link.name or preset_label(link.duration))}</b> · {escape(describe_duration(link.duration))} "
-            f"· {link.uses} joined\n<code>{escape(link.invite_link)}</code>\n"
-        )
-    return "\n".join(lines)
 
 
 @router.callback_query(F.data.startswith("inpick:"))
@@ -712,9 +872,8 @@ async def cb_invite_pick(call: CallbackQuery, bot: Bot, db: Database, settings: 
     await _edit(
         call,
         f"➕ <b>New invite link — {escape(chat.display)}</b>\n\n"
-        "How long should members joining through this link stay?\n"
-        "<i>To add a label: <code>/invite 3m Gold plan</code></i>",
-        invite_pick_keyboard(chat_id),
+        "How long should members joining through this link stay?",
+        K.invite_pick_keyboard(chat_id),
     )
     await call.answer()
 
@@ -732,12 +891,50 @@ async def cb_invite_new(
     if not url:
         await call.answer(msg, show_alert=True)
         return
-    links = await db.list_invite_links(chat_id)
-    await _edit(call, invites_text(chat, links), invites_keyboard(chat, links))
-    await call.answer(f"Created · {preset_label(value)}")
+    await _show(call, S.invite_created_screen(chat, url, msg, value))
+    await call.answer(f"Created · {K.preset_label(value)}")
+
+
+@router.callback_query(F.data.startswith("incust:"))
+async def cb_invite_custom(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
+    chat_id = int(_ids(call.data, 1)[0])
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    await _begin_input(
+        call,
+        state,
+        CustomInput.invite_custom,
+        f"✏️ <b>Custom invite link — {escape(chat.display)}</b>\n\n"
+        "Send the duration followed by an optional label, e.g.\n"
+        "<code>3m Gold plan</code> · <code>45d Trial</code> · <code>never Founders</code>",
+        f"invites:{chat_id}",
+        chat_id=chat_id,
+    )
 
 
 @router.callback_query(F.data.startswith("irev:"))
+async def cb_invite_revoke_confirm(call: CallbackQuery, bot: Bot, db: Database, settings: Settings) -> None:
+    chat_id_s, suffix = _ids(call.data, 2)
+    chat_id = int(chat_id_s)
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    target = next((l for l in await db.list_invite_links(chat_id) if l.invite_link.endswith(suffix)), None)
+    if not target:
+        await call.answer("Link not found", show_alert=True)
+        return
+    await _edit(
+        call,
+        f"🗑 <b>Revoke this link?</b>\n\n<b>{escape(target.name or K.preset_label(target.duration))}</b> · "
+        f"{target.uses} joined\n<code>{escape(target.invite_link)}</code>\n\n"
+        "<i>Members who already joined keep their duration.</i>",
+        K.invite_revoke_confirm_keyboard(chat_id, suffix),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("irevc:"))
 async def cb_invite_revoke(
     call: CallbackQuery, bot: Bot, db: Database, settings: Settings, service: MembershipService
 ) -> None:
@@ -751,9 +948,169 @@ async def cb_invite_revoke(
         await call.answer("Link not found", show_alert=True)
         return
     ok, msg = await service.revoke_invite_link(chat, target.invite_link, call.from_user.id)
-    links = await db.list_invite_links(chat_id)
-    await _edit(call, invites_text(chat, links), invites_keyboard(chat, links))
+    await _show(call, await S.invites_screen(db, chat))
     await call.answer("Revoked" if ok else f"Marked revoked locally: {msg}", show_alert=not ok)
+
+
+# ------------------------------------------------------------------- tools
+@router.callback_query(F.data.startswith("addm:"))
+async def cb_add_member(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
+    chat_id = int(_ids(call.data, 1)[0])
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    await _begin_input(
+        call,
+        state,
+        CustomInput.add_member,
+        f"➕ <b>Add member — {escape(chat.display)}</b>\n\n"
+        "Send the user ID or @username, optionally followed by a duration:\n"
+        "<code>123456789</code> · <code>@alice 3m</code> · <code>123456789 2025-12-31</code>\n\n"
+        f"<i>Without a duration the default ({escape(describe_duration(chat.default_duration or settings.default_duration))}) is used.</i>",
+        f"tools:{chat_id}",
+        chat_id=chat_id,
+    )
+
+
+@router.callback_query(F.data.startswith("search:"))
+async def cb_search(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
+    chat_id = int(_ids(call.data, 1)[0])
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    await _begin_input(
+        call,
+        state,
+        CustomInput.search,
+        f"🔍 <b>Search — {escape(chat.display)}</b>\n\nSend a name, @username or user ID (2+ characters).",
+        f"list:{chat_id}:active:0",
+        chat_id=chat_id,
+    )
+
+
+@router.callback_query(F.data.startswith("bcast:"))
+async def cb_broadcast(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
+    chat_id = int(_ids(call.data, 1)[0])
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    total = await db.count_members(chat_id, "active")
+    if not total:
+        await call.answer("No active members to message.", show_alert=True)
+        return
+    await _begin_input(
+        call,
+        state,
+        CustomInput.broadcast,
+        f"📣 <b>Broadcast — {escape(chat.display)}</b>\n\n"
+        f"Send the message for your <b>{total}</b> active members. You'll confirm before it goes out.\n"
+        "<i>Only members who have started a private chat with me can receive it.</i>",
+        f"tools:{chat_id}",
+        chat_id=chat_id,
+    )
+
+
+@router.callback_query(F.data.startswith("bcastc:"))
+async def cb_broadcast_confirm(
+    call: CallbackQuery, bot: Bot, db: Database, settings: Settings, service: MembershipService, state: FSMContext
+) -> None:
+    chat_id = int(_ids(call.data, 1)[0])
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    data = await state.get_data()
+    text = str(data.get("text") or "")
+    if not text or int(data.get("chat_id", 0)) != chat_id:
+        await state.clear()
+        await call.answer("Nothing to send — start again.", show_alert=True)
+        await _show(call, S.tools_screen(chat))
+        return
+    await state.clear()
+    total = await db.count_members(chat_id, "active")
+    await _edit(call, f"📣 Sending to {total} members…\n{progress_bar(0, total)}")
+
+    async def progress(done: int, total_: int) -> None:
+        await _edit(call, f"📣 Sending… <b>{done}</b>/{total_}\n{progress_bar(done, total_)}")
+
+    sent, total = await service.broadcast(chat, text, call.from_user.id, progress=progress)
+    await _edit(
+        call,
+        f"📣 <b>Broadcast delivered</b> to <b>{sent}</b> of {total} members.\n{progress_bar(total, total)}"
+        + ("" if sent == total else "\n<i>Members who never started a private chat with me can't be reached.</i>"),
+        K.back_keyboard(chat_id),
+    )
+    await call.answer("Sent")
+
+
+@router.callback_query(F.data.startswith("vips:"))
+async def cb_vips(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
+    chat_id = int(_ids(call.data, 1)[0])
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    await state.clear()
+    await _show(call, await S.vips_screen(db, chat))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("sync:"))
+async def cb_sync(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, service: MembershipService) -> None:
+    chat_id = int(_ids(call.data, 1)[0])
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    total = await db.count_members(chat_id, "active")
+    if total > 2000:
+        await call.answer("Too many members to sync interactively (limit 2000).", show_alert=True)
+        return
+    await _edit(call, f"🔄 Syncing <b>{total}</b> members with Telegram…")
+    result = await service.sync_chat_members(chat)
+    await _edit(
+        call,
+        f"✅ <b>Sync complete — {escape(chat.display)}</b>\n\n"
+        f"Checked: <b>{result['checked']}</b>\nLeft/removed: <b>{result['gone']}</b>\nErrors: <b>{result['errors']}</b>",
+        K.cancel_keyboard(f"tools:{chat_id}", "◀️ Tools"),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("fcheck:"))
+async def cb_forcecheck(
+    call: CallbackQuery, bot: Bot, db: Database, settings: Settings, scheduler: ExpiryScheduler
+) -> None:
+    chat_id = int(_ids(call.data, 1)[0])
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    result = await scheduler.run_once()
+    if result.get("skipped"):
+        await call.answer("A check is already running, try again in a moment.", show_alert=True)
+        return
+    await _edit(
+        call,
+        "🔁 <b>Expiry check complete</b>\n\n"
+        f"Removed: <b>{result.get('removed', 0)}</b>\nReminded: <b>{result.get('reminded', 0)}</b>\n"
+        f"Prompts timed out: <b>{result.get('prompts_expired', 0)}</b>",
+        K.cancel_keyboard(f"tools:{chat_id}", "◀️ Tools"),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("perms:"))
+async def cb_permissions(call: CallbackQuery, bot: Bot, db: Database, settings: Settings) -> None:
+    chat_id = int(_ids(call.data, 1)[0])
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    ok = await bot_can_restrict(bot, chat_id)
+    await _edit(
+        call,
+        f"🔐 <b>Permissions — {escape(chat.display)}</b>\n\n"
+        f"Ban users: {'✅ granted' if ok else '❌ missing'}\n\n"
+        + ("Everything I need is in place." if ok else "Promote me to admin with the <b>Ban users</b> right so I can remove expired members."),
+        K.cancel_keyboard(f"tools:{chat_id}", "◀️ Tools"),
+    )
+    await call.answer()
 
 
 # ------------------------------------------------------------ misc buttons
@@ -776,7 +1133,10 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await message.answer("Cancelled.")
 
 
-@router.message(CustomInput.join_duration, F.text, F.chat.type == ChatType.PRIVATE)
+PRIVATE_TEXT = (F.text, F.chat.type == ChatType.PRIVATE)
+
+
+@router.message(CustomInput.join_duration, *PRIVATE_TEXT)
 async def on_join_custom_text(
     message: Message, bot: Bot, db: Database, settings: Settings, service: MembershipService, state: FSMContext
 ) -> None:
@@ -794,9 +1154,7 @@ async def on_join_custom_text(
     try:
         service.expiry_from_text(value)
     except ParseError as exc:
-        await message.reply(
-            f"⚠️ {escape(str(exc))}\nTry again (e.g. <code>45d</code>, <code>2025-12-31</code>, <code>never</code>) or /cancel."
-        )
+        await message.reply(f"⚠️ {escape(str(exc))}\nTry again ({INPUT_HINT}) or /cancel.")
         return
     await state.clear()
     if pending.source == "request":
@@ -806,17 +1164,15 @@ async def on_join_custom_text(
     await message.answer(outcome if ok else f"❌ {outcome}")
 
 
-@router.message(CustomInput.member_expiry, F.text, F.chat.type == ChatType.PRIVATE)
+@router.message(CustomInput.member_expiry, *PRIVATE_TEXT)
 async def on_member_custom_text(
     message: Message, bot: Bot, db: Database, settings: Settings, service: MembershipService, state: FSMContext
 ) -> None:
-    data = await state.get_data()
-    chat_id, uid = int(data.get("chat_id", 0)), int(data.get("user_id", 0))
-    chat = await db.get_chat(chat_id)
-    if not chat or not await is_admin(bot, db, settings, chat_id, message.from_user.id):
-        await state.clear()
+    chat = await _input_chat(message, bot, db, settings, state)
+    if not chat:
         return
-    member = await db.get_member(chat_id, uid)
+    uid = int((await state.get_data()).get("user_id", 0))
+    member = await db.get_member(chat.chat_id, uid)
     if not member:
         await state.clear()
         await message.answer("⚠️ Member is no longer tracked.")
@@ -828,15 +1184,218 @@ async def on_member_custom_text(
         await message.reply(f"⚠️ {escape(str(exc))}\nTry again or /cancel.")
         return
     await state.clear()
-    member = await db.get_member(chat_id, uid)
-    await message.answer(
-        service.member_card(chat, member), reply_markup=member_keyboard(chat_id, uid, member.is_active)
-    )
+    member = await db.get_member(chat.chat_id, uid)
+    await message.answer(service.member_card(chat, member), reply_markup=K.member_keyboard(chat.chat_id, uid, member.is_active))
     await service.notify_extension(chat, uid, new_expiry)
 
 
-# ------------------------------------------- smart lookup: ID / @username
+@router.message(CustomInput.member_note, *PRIVATE_TEXT)
+async def on_member_note_text(
+    message: Message, bot: Bot, db: Database, settings: Settings, service: MembershipService, state: FSMContext
+) -> None:
+    chat = await _input_chat(message, bot, db, settings, state)
+    if not chat:
+        return
+    uid = int((await state.get_data()).get("user_id", 0))
+    await state.clear()
+    member = await db.get_member(chat.chat_id, uid)
+    if not member:
+        await message.answer("⚠️ Member is no longer tracked.")
+        return
+    text = (message.text or "").strip()
+    note = None if text in ("-", "clear", "none") else text[:500]
+    await db.set_member_note(chat.chat_id, uid, note)
+    await db.add_log(chat.chat_id, uid, "note", (note or "")[:40] or None, message.from_user.id)
+    member = await db.get_member(chat.chat_id, uid)
+    await message.answer(
+        ("📝 Note saved.\n\n" if note else "📝 Note cleared.\n\n") + service.member_card(chat, member),
+        reply_markup=K.member_keyboard(chat.chat_id, uid, member.is_active),
+    )
+
+
+@router.message(CustomInput.add_member, *PRIVATE_TEXT)
+async def on_add_member_text(
+    message: Message, bot: Bot, db: Database, settings: Settings, service: MembershipService, state: FSMContext
+) -> None:
+    chat = await _input_chat(message, bot, db, settings, state)
+    if not chat:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if not parts:
+        return
+    uid, err = await service.resolve_user(chat.chat_id, parts[0])
+    if uid is None:
+        await message.reply(f"⚠️ {escape(err or 'Not found.')}\nSend a numeric ID or @username, or /cancel.")
+        return
+    expiry_text = parts[1].strip() if len(parts) > 1 else ""
+    try:
+        expires = service.expiry_from_text(expiry_text) if expiry_text else service.compute_expiry(chat)
+    except ParseError as exc:
+        await message.reply(f"⚠️ Invalid duration/date: {escape(str(exc))}\nTry again or /cancel.")
+        return
+    await state.clear()
+    try:
+        cm = await bot.get_chat_member(chat.chat_id, uid)
+        full_name, username = cm.user.full_name, cm.user.username
+    except (TelegramBadRequest, TelegramForbiddenError):
+        full_name, username = None, None
+    member = await db.upsert_member(chat.chat_id, uid, full_name, username, expires, message.from_user.id, source="manual")
+    pending = await db.get_pending_for(chat.chat_id, uid)
+    if pending:
+        await db.resolve_pending(pending.id, message.from_user.id, expiry_text or "default")
+    await db.add_log(chat.chat_id, uid, "manual_add", str(expires), message.from_user.id)
+    await message.answer(
+        "✅ <b>Tracking started</b>\n\n" + service.member_card(chat, member),
+        reply_markup=K.member_keyboard(chat.chat_id, uid, True),
+    )
+
+
+@router.message(CustomInput.search, *PRIVATE_TEXT)
+async def on_search_text(
+    message: Message, bot: Bot, db: Database, settings: Settings, state: FSMContext
+) -> None:
+    chat = await _input_chat(message, bot, db, settings, state)
+    if not chat:
+        return
+    query = (message.text or "").strip()
+    if len(query) < 2:
+        await message.reply("Type at least 2 characters, or /cancel.")
+        return
+    await state.clear()
+    text, markup = await S.members_screen(db, chat, settings, "active", 0, query=query[:64])
+    await message.answer(text, reply_markup=markup)
+
+
+@router.message(CustomInput.broadcast, *PRIVATE_TEXT)
+async def on_broadcast_text(
+    message: Message, bot: Bot, db: Database, settings: Settings, state: FSMContext
+) -> None:
+    chat = await _input_chat(message, bot, db, settings, state)
+    if not chat:
+        return
+    text = (message.html_text or message.text or "").strip()
+    if not text:
+        return
+    await state.update_data(text=text[:3500])
+    total = await db.count_members(chat.chat_id, "active")
+    await message.answer(
+        f"📣 <b>Preview</b> · to <b>{total}</b> members of {escape(chat.display)}\n\n"
+        f"{text[:3500]}\n\n<i>Send it?</i>",
+        reply_markup=K.broadcast_confirm_keyboard(chat.chat_id, total),
+    )
+
+
+@router.message(CustomInput.welcome_text, *PRIVATE_TEXT)
+async def on_welcome_text(
+    message: Message, bot: Bot, db: Database, settings: Settings, state: FSMContext
+) -> None:
+    chat = await _input_chat(message, bot, db, settings, state)
+    if not chat:
+        return
+    text = (message.text or "").strip()
+    if not text:
+        return
+    await state.clear()
+    await db.update_chat(chat.chat_id, welcome_text=text[:1000], welcome_enabled=1)
+    await db.add_log(chat.chat_id, None, "set_welcome", None, message.from_user.id)
+    chat = await db.get_chat(chat.chat_id)
+    body, markup = S.advanced_screen(chat)
+    await message.answer("👋 Welcome message saved and enabled.\n\n" + body, reply_markup=markup)
+
+
+@router.message(CustomInput.log_chat, *PRIVATE_TEXT)
+async def on_log_chat_text(
+    message: Message, bot: Bot, db: Database, settings: Settings, state: FSMContext
+) -> None:
+    chat = await _input_chat(message, bot, db, settings, state)
+    if not chat:
+        return
+    arg = (message.text or "").strip()
+    if arg.lower() in ("off", "none", "0", "-"):
+        await state.clear()
+        await db.update_chat(chat.chat_id, log_chat_id=None)
+        body, markup = S.advanced_screen(await db.get_chat(chat.chat_id))
+        await message.answer("📨 Log channel disabled.\n\n" + body, reply_markup=markup)
+        return
+    if arg.lower() == "here":
+        target = message.chat.id
+    elif arg.lstrip("-").isdigit():
+        target = int(arg)
+    else:
+        await message.reply("Send a numeric chat ID (e.g. <code>-1001234567890</code>), <code>here</code>, or /cancel.")
+        return
+    try:
+        await bot.send_message(target, f"📨 Log channel set for <b>{escape(chat.display)}</b>.")
+    except Exception as exc:  # noqa: BLE001
+        await message.reply(f"❌ I cannot post there: {escape(str(exc))}\nMake me an admin of that chat and try again, or /cancel.")
+        return
+    await state.clear()
+    await db.update_chat(chat.chat_id, log_chat_id=target)
+    await db.add_log(chat.chat_id, None, "set_log", str(target), message.from_user.id)
+    body, markup = S.advanced_screen(await db.get_chat(chat.chat_id))
+    await message.answer(f"📨 Logs will be posted to <code>{target}</code>.\n\n" + body, reply_markup=markup)
+
+
+@router.message(CustomInput.chat_duration, *PRIVATE_TEXT)
+async def on_chat_duration_text(
+    message: Message, bot: Bot, db: Database, settings: Settings, state: FSMContext
+) -> None:
+    chat = await _input_chat(message, bot, db, settings, state)
+    if not chat:
+        return
+    value = (message.text or "").strip().lower()
+    if not is_permanent(value):
+        try:
+            parse_duration(value)
+        except ParseError as exc:
+            await message.reply(f"⚠️ {escape(str(exc))}\nTry again (e.g. <code>45d</code>, <code>2w</code>) or /cancel.")
+            return
+    await state.clear()
+    await db.update_chat(chat.chat_id, default_duration=value)
+    await db.add_log(chat.chat_id, None, "set_duration", value, message.from_user.id)
+    body, markup = S.settings_screen(await db.get_chat(chat.chat_id), settings)
+    await message.answer(f"⏳ Default duration: <b>{escape(describe_duration(value))}</b>\n\n" + body, reply_markup=markup)
+
+
+@router.message(CustomInput.invite_custom, *PRIVATE_TEXT)
+async def on_invite_custom_text(
+    message: Message, bot: Bot, db: Database, settings: Settings, service: MembershipService, state: FSMContext
+) -> None:
+    chat = await _input_chat(message, bot, db, settings, state)
+    if not chat:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if not parts:
+        return
+    duration = parts[0].lower()
+    name = parts[1].strip() if len(parts) > 1 else None
+    url, msg = await service.create_invite_link(chat, duration, name, message.from_user.id)
+    if not url:
+        await message.reply(f"⚠️ {escape(msg)}\nTry again (e.g. <code>3m Gold plan</code>) or /cancel.")
+        return
+    await state.clear()
+    text, markup = S.invite_created_screen(chat, url, msg, duration)
+    await message.answer(text, reply_markup=markup)
+
+
+# ------------------------------------------- smart lookup: ID / @username / name
 _LOOKUP_RE = re.compile(r"^(@[A-Za-z][A-Za-z0-9_]{3,31}|\d{5,15})$")
+
+
+async def _lookup_chat(message: Message, bot: Bot, db: Database, settings: Settings) -> Chat | None:
+    """The chat a free-text lookup in private chat refers to (selected or the only one)."""
+    user_id = message.from_user.id
+    chat_id = await db.get_context(user_id)
+    if chat_id is None:
+        chats = await _admin_chats(db, settings, user_id)
+        if len(chats) != 1:
+            return None  # not an admin, or ambiguous → ignore silently
+        chat_id = chats[0].chat_id
+        await db.set_context(user_id, chat_id)
+    chat = await db.get_chat(chat_id)
+    if not chat or not await is_admin(bot, db, settings, chat_id, user_id):
+        return None
+    return chat
 
 
 @router.message(F.chat.type == ChatType.PRIVATE, F.text.regexp(_LOOKUP_RE), StateFilter(None))
@@ -844,33 +1403,41 @@ async def on_private_lookup(
     message: Message, bot: Bot, db: Database, settings: Settings, service: MembershipService
 ) -> None:
     """Typing a user ID or @username in private chat opens the member card of the selected chat."""
-    user_id = message.from_user.id
-    chat_id = await db.get_context(user_id)
-    if chat_id is None:
-        chats = await _admin_chats(db, settings, user_id)
-        if len(chats) != 1:
-            return  # not an admin, or ambiguous → ignore silently
-        chat_id = chats[0].chat_id
-        await db.set_context(user_id, chat_id)
-    chat = await db.get_chat(chat_id)
-    if not chat or not await is_admin(bot, db, settings, chat_id, user_id):
+    chat = await _lookup_chat(message, bot, db, settings)
+    if not chat:
         return
-    uid, err = await service.resolve_user(chat_id, message.text.strip())
+    token = message.text.strip()
+    uid, err = await service.resolve_user(chat.chat_id, token)
     if uid is None:
-        await message.reply(f"🔍 {escape(err or 'Not found.')}")
+        text, markup = await S.members_screen(db, chat, settings, "active", 0, query=token.lstrip("@"))
+        await message.answer(text, reply_markup=markup)
         return
-    member = await db.get_member(chat_id, uid)
+    member = await db.get_member(chat.chat_id, uid)
     if not member:
-        found = await db.search_members(chat_id, message.text.strip().lstrip("@"), limit=5)
+        found, _ = await db.list_members_view(chat.chat_id, "all", 5, 0, query=token.lstrip("@"))
         if found:
-            lines = [f"🔍 <b>Matches in {escape(chat.display)}</b>", ""]
-            lines += [f"• {m.mention_html} · <code>{m.user_id}</code> · {m.status}" for m in found]
-            lines.append("\n<i>Send the ID to open a card.</i>")
-            await message.reply("\n".join(lines))
+            text, markup = await S.members_screen(db, chat, settings, "active", 0, query=token.lstrip("@"))
+            await message.answer(text, reply_markup=markup)
             return
         await message.reply(
-            f"<code>{uid}</code> is not tracked in <b>{escape(chat.display)}</b>.\n"
-            f"Start tracking with <code>/add {uid} 1m</code>."
+            f"<code>{uid}</code> is not tracked in <b>{escape(chat.display)}</b>.",
+            reply_markup=K.cancel_keyboard(f"addm:{chat.chat_id}", "➕ Add member"),
         )
         return
-    await message.answer(service.member_card(chat, member), reply_markup=member_keyboard(chat_id, uid, member.is_active))
+    await message.answer(service.member_card(chat, member), reply_markup=K.member_keyboard(chat.chat_id, uid, member.is_active))
+
+
+@router.message(
+    F.chat.type == ChatType.PRIVATE,
+    F.text,
+    ~F.text.startswith("/"),
+    F.text.func(lambda t: 2 <= len(t.strip()) <= 64),
+    StateFilter(None),
+)
+async def on_private_name_search(message: Message, bot: Bot, db: Database, settings: Settings) -> None:
+    """Any other short text from an admin in private chat is treated as a member search."""
+    chat = await _lookup_chat(message, bot, db, settings)
+    if not chat:
+        return
+    text, markup = await S.members_screen(db, chat, settings, "active", 0, query=message.text.strip())
+    await message.answer(text, reply_markup=markup)

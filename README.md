@@ -21,9 +21,11 @@ Built with Python 3.11+, [aiogram 3](https://docs.aiogram.dev/), SQLite and APSc
 | **Per-chat defaults** | Each group/channel can have its own default duration; falls back to a global default. |
 | **Expiry reminders** | DMs users 72h / 24h / 1h before expiry (configurable). Expiry notice on removal. |
 | **Whitelist / VIP** | Whitelisted users and chat admins are never removed. |
-| **Button-first dashboard** | Home → chat → dashboard → settings. Only the essentials on each screen; rarely used switches live under *Advanced*. |
+| **Button-first dashboard** | Home → chat → dashboard → settings. Only the essentials on each screen; rarely used switches live under *Advanced*, power actions under *Tools*. Every screen has a 🏠 escape hatch. |
+| **Tappable member lists** | Tabs **Active · Expiring · Lifetime · Past** with live counts, one button per member (`🟢 Alice · 12d`, `🟠 Bob · 5h`, `♾ Carol · ∞`), pager, inline search — no IDs to type. Tap a row to open the card; *Back* returns to the same tab & page. |
 | **Manage channels from private chat** | Channels have no chat commands, so `/chats` lets admins pick a chat and manage it via DM. |
-| **Member cards** | `/info` shows a card with one-tap **+7d / +1m / +3m / ♾ / Remove / Whitelist** buttons. |
+| **Member cards** | `/info` (or a tap in the list) shows a card with one-tap **+1w / +1m / +3m / ♾ / Custom / More** buttons; *More* adds +6m, +1y, history, note, ask-owner, VIP, remove, untrack. |
+| **Copy & share links** | Invite links have native 📋 *copy* buttons (Telegram `copy_text`) and a 📤 *share* button; revoking asks for confirmation. |
 | **Audit logs** | Every action is stored and optionally mirrored to a log channel (`/setlog`). |
 | **Stats & reports** | `/stats`, `/list`, `/expiring 3d`, `/logs`, global stats for super-admins. |
 | **Welcome messages** | Optional templated welcome with `{mention} {name} {expires} {chat}`. |
@@ -144,10 +146,16 @@ The bot is designed so that an owner almost never types a command:
 |--------|--------------|
 | **Bottom menu** (persistent) | `📊 Dashboard` `👥 Members` · `🔔 Pending` `🔗 Invite links` · `⚙️ Settings` `📂 My chats` · `📖 Help` |
 | **Home** (`/start`) | `📂 My chats` · `➕ Add to group` · `📖 Help` |
-| **Dashboard** | `👥 Members` `📊 Overview` · `🔔 Pending (n)` `🔗 Invite links` · `⚙️ Settings` `📜 Activity` |
-| **Settings** | Duration · Tracking · Auto-remove · Ask on join · Kick/Ban · `🔧 Advanced` |
+| **My chats** | One row per chat with live badges: `▸ 👥 VIP Club · 120 · 🔔3` (active members · pending prompts) |
+| **Dashboard** | `👥 Members` `⏰ Expiring · n` · `🔔 Pending · n` `🔗 Invite links` · `📊 Overview` `📜 Activity` · `⚙️ Settings` `🛠 Tools` |
+| **Members** | Tabs `▸ 🟢 Active 30` `⏰ Expiring 2` `♾ Lifetime 1` `📁 Past 7` · tappable rows · `◀️ 2 / 4 ▶️` pager · `🔍 Search` `➕ Add member` |
+| **Tools** | `➕ Add member` `🔍 Search` · `📣 Broadcast` (with preview + confirm + progress bar) `🛡 VIP list` · `🔄 Sync` `🔁 Run expiry check` · `🔐 Check permissions` |
+| **Settings** | Duration (current preset marked `✓`, `✏️ Custom`) · Tracking · Auto-remove · Ask on join · Kick/Ban · `🔧 Advanced` |
+| **Advanced** | Member DMs · Welcome on/off · Join requests (ignore / auto / ask) · Prompts → owner/admins · `✏️ Welcome text` `📨 Log channel` editors |
+| **Pending** | One row per waiting member (`🙋` request / `👤` join) · `✅ Default for all (n)` bulk action with confirmation |
 | **Join prompt** (DM) | `✅ Keep · 1 month` · three quick picks · `⋯ More options` / `🚫 Remove` |
-| **Member card** | `+1 month` `+3 months` `♾ Lifetime` · `✏️ Custom` `⋯ More` |
+| **Member card** | `+1 week` `+1 month` `+3 months` · `♾ Lifetime` `✏️ Custom` `⋯ More` · `◀️ Members` (same tab/page) |
+| **Activity** | Paged audit log (`◀️ Newer` / `Older ▶️`) |
 | **Help** | Short topic pages instead of a command wall |
 
 The **bottom menu** is a Telegram reply keyboard installed on `/start` (and refreshed the moment your first
@@ -156,7 +164,9 @@ a chat see `➕ Add to group · 📖 Help`, admins with chats get the full menu.
 as the matching inline button and cancels any pending text input, so you can never get "stuck" in a flow.
 With one tracked chat it is auto-selected; with several, `📂 My chats` / a chat picker appears.
 
-Typing a **user ID or @username** in the private chat opens that member's card directly.
+Typing a **user ID or @username** in the private chat opens that member's card directly; any other short
+text (2–64 chars) is treated as a **name search** in the selected chat. Free-form values (custom dates,
+welcome text, broadcast) are collected via short guided inputs that always carry a `❌ Cancel` button.
 The Telegram "/" menu only lists `start`, `chats`, `pending`, `help` (and reply-shortcuts in groups).
 
 ## 📖 Commands (power users)
@@ -168,7 +178,7 @@ All commands still work; they are simply not advertised in the menu.
 |---------|-------------|
 | `/chats` (`/menu`) | Open the dashboard for a group/channel |
 | `/pending` | Joins waiting for your duration decision |
-| `/stats` · `/list [page]` · `/expiring [7d]` · `/logs` | Reports |
+| `/stats` · `/list [active\|soon\|lifetime\|past] [page]` · `/expiring [7d]` · `/logs` | Reports (in private chat these open the tappable screens) |
 | `/search <name\|@user\|id>` | Find a member |
 | `/permissions` · `/forcecheck` · `/sync` | Diagnostics |
 | `/setduration <30d\|1m\|never\|global>` | Default duration for this chat |
@@ -207,7 +217,8 @@ bot/
     common.py                # /start /help /mystatus /id
     menu.py                  # persistent bottom-menu (reply keyboard) taps
     admin.py                 # admin commands
-    callbacks.py             # inline button handlers
+    callbacks.py             # inline button handlers + guided text inputs (FSM)
+    screens.py               # every admin view rendered as (text, keyboard) — shared by commands, menu, callbacks
     tracking.py              # join/leave/bot-added/join-request/invite-link events
   services/
     database.py              # aiosqlite persistence layer
@@ -217,10 +228,11 @@ bot/
   utils/
     timeparse.py             # durations & dates parsing
     keyboards.py             # inline keyboards + bottom reply menu
+    ui.py                    # pure presentation helpers: clip, urgency glyphs, compact deltas, progress bar
     permissions.py           # admin checks
     cache.py                 # TTL + LRU cache for hot read paths
     telegram.py              # tg_call / tg_try: retries for flood limits & network blips
-tests/                       # pytest suite (78 tests)
+tests/                       # pytest suite (100 tests)
 ```
 
 Run tests: `python -m pytest -q`

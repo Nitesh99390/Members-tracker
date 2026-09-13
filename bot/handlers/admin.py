@@ -14,17 +14,21 @@ from aiogram.types import FSInputFile, Message
 
 from bot import VERSION_TAG, __version__
 from bot.config import Settings
+from bot.handlers import screens as S
+from bot.handlers.screens import (  # noqa: F401 - re-exported for backwards compatibility
+    dashboard_text,
+    logs_text,
+    settings_text,
+    stats_text,
+)
 from bot.services.database import Chat, Database, Member
 from bot.services.membership import MembershipService
 from bot.services.metrics import Metrics
 from bot.services.scheduler import ExpiryScheduler
 from bot.utils.keyboards import (
     chats_keyboard,
-    dashboard_keyboard,
-    invites_keyboard,
     member_keyboard,
     open_private_keyboard,
-    pending_keyboard,
     settings_keyboard,
 )
 from bot.utils.permissions import bot_can_restrict, is_admin
@@ -157,11 +161,13 @@ async def cmd_chats(message: Message, bot: Bot, db: Database, settings: Settings
         chat = await db.get_chat(current)
         if chat:
             if cmd == "settings":
-                await message.answer(settings_text(chat, settings), reply_markup=_settings_markup(chat, settings))
+                text, markup = S.settings_screen(chat, settings)
             else:
-                await message.answer(await dashboard_text(db, chat, settings), reply_markup=dashboard_keyboard(chat, await db.count_pending(chat.chat_id)))
+                text, markup = await S.dashboard_screen(db, chat, settings, len(chats) > 1)
+            await message.answer(text, reply_markup=markup)
             return
-    await message.answer("📂 <b>Your chats</b>\nChoose one to manage:", reply_markup=chats_keyboard(chats, current))
+    text, markup = await S.chats_screen(db, chats, current)
+    await message.answer(text, reply_markup=markup)
 
 
 @router.message(Command("panel", "settings", "menu", "dashboard", "chats"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
@@ -178,45 +184,6 @@ async def cmd_panel_group(message: Message, bot: Bot, db: Database, settings: Se
     )
 
 
-async def dashboard_text(db: Database, chat: Chat, settings: Settings) -> str:
-    icon = "📢" if chat.is_channel else "👥"
-    duration = chat.default_duration or settings.default_duration
-    s = await db.member_stats(chat.chat_id)
-    now = datetime.now(timezone.utc)
-    soon_7d = await db.expiring_within_count(chat.chat_id, now + timedelta(days=7))
-    pending = await db.count_pending(chat.chat_id)
-    status = "" if chat.tracking_enabled else "\n⏸ <i>Tracking is paused</i>"
-    attention = ""
-    if pending:
-        attention += f"\n🔔 <b>{pending}</b> waiting for your decision"
-    if soon_7d:
-        attention += f"\n⏰ <b>{soon_7d}</b> expiring within 7 days"
-    return (
-        f"{icon} <b>{escape(chat.display)}</b>{status}\n\n"
-        f"🟢 Active members: <b>{s.get('active', 0)}</b>\n"
-        f"⏳ Default duration: <b>{escape(describe_duration(duration))}</b>"
-        f"{attention}"
-    )
-
-
-def settings_text(chat: Chat, settings: Settings) -> str:
-    duration = chat.default_duration or settings.default_duration
-    ask = settings.ask_on_join_default if chat.ask_on_join is None else chat.ask_on_join
-    who = "the owner" if chat.ask_target == "owner" else "all admins"
-    join_line = (
-        f"New members: <b>{escape(describe_duration(duration))}</b>, {who} get a one-tap prompt to change it."
-        if ask
-        else f"New members: <b>{escape(describe_duration(duration))}</b>, applied silently."
-    )
-    return (
-        f"⚙️ <b>Settings — {escape(chat.display)}</b>\n\n"
-        f"{join_line}\n"
-        f"Expired members are {'<b>removed automatically</b>' if chat.auto_kick else '<b>kept</b> (auto-remove off)'} "
-        f"({'ban' if chat.kick_mode == 'ban' else 'kick, can rejoin'}).\n\n"
-        f"<i>Tap a switch to change it.</i>"
-    )
-
-
 # kept for backwards compatibility with older imports
 panel_text = settings_text
 
@@ -227,27 +194,11 @@ async def cmd_stats(message: Message, bot: Bot, db: Database, settings: Settings
     chat = await resolve_chat(message, bot, db, settings)
     if not chat:
         return
+    if message.chat.type == ChatType.PRIVATE:
+        text, markup = await S.stats_screen(db, chat, settings)
+        await message.answer(text, reply_markup=markup)
+        return
     await message.reply(await stats_text(db, chat, settings))
-
-
-async def stats_text(db: Database, chat: Chat, settings: Settings) -> str:
-    s = await db.member_stats(chat.chat_id)
-    now = datetime.now(timezone.utc)
-    soon_24 = await db.expiring_within_count(chat.chat_id, now + timedelta(hours=24))
-    soon_7d = await db.expiring_within_count(chat.chat_id, now + timedelta(days=7))
-    wl = len(await db.list_whitelist(chat.chat_id))
-    pending = await db.count_pending(chat.chat_id)
-    return (
-        f"📊 <b>Overview — {escape(chat.display)}</b>\n\n"
-        f"🟢 Active: <b>{s.get('active', 0)}</b> · joined today: {s.get('joined_today', 0)}\n"
-        f"♾ Lifetime: <b>{s.get('permanent', 0)}</b> · 🛡 VIP: <b>{wl}</b>\n"
-        f"🔔 Awaiting decision: <b>{pending}</b>\n\n"
-        f"⏰ Expiring in 24h: <b>{soon_24}</b>\n"
-        f"📅 Expiring in 7 days: <b>{soon_7d}</b>\n\n"
-        f"⌛ Expired: {s.get('expired', 0)} · 🚫 Removed: {s.get('manual', 0)} · "
-        f"⚪ Left: {s.get('left', 0)} · 🔴 Kicked: {s.get('kicked', 0)}\n\n"
-        f"<i>{format_dt(now, settings.tz)} · {settings.timezone}</i>"
-    )
 
 
 # ------------------------------------------------------------------- /list
@@ -258,14 +209,22 @@ async def cmd_list(
     chat = await resolve_chat(message, bot, db, settings)
     if not chat:
         return
-    page = 0
-    if command.args and command.args.strip().isdigit():
-        page = max(0, int(command.args.strip()) - 1)
+    page, view = 0, "active"
+    for token in (command.args or "").split():
+        if token.isdigit():
+            page = max(0, int(token) - 1)
+        elif token.lower() in db.MEMBER_FILTERS:
+            view = token.lower()
+    if message.chat.type == ChatType.PRIVATE:
+        text, markup = await S.members_screen(db, chat, settings, view, page)
+        await message.answer(text, reply_markup=markup)
+        return
     text, _ = await list_text(db, chat, settings, page)
     await message.reply(text)
 
 
 async def list_text(db: Database, chat: Chat, settings: Settings, page: int) -> tuple[str, bool]:
+    """Plain text member list for group chats (no tappable rows there)."""
     members = await db.list_members(chat.chat_id, "active", PAGE_SIZE + 1, page * PAGE_SIZE)
     has_next = len(members) > PAGE_SIZE
     members = members[:PAGE_SIZE]
@@ -278,7 +237,7 @@ async def list_text(db: Database, chat: Chat, settings: Settings, page: int) -> 
         rem = "♾" if m.expires_at is None else humanize_delta(m.expires_at - now)
         lines.append(f"{i}. {m.mention_html} · <code>{m.user_id}</code> · ⏳ {rem}")
     lines.append("")
-    lines.append("<i>Send a user ID or @username to open their card.</i>")
+    lines.append("<i>Open my private chat for the tappable list.</i>")
     return "\n".join(lines), has_next
 
 
@@ -680,20 +639,11 @@ async def cmd_logs(message: Message, bot: Bot, db: Database, settings: Settings)
     chat = await resolve_chat(message, bot, db, settings)
     if not chat:
         return
+    if message.chat.type == ChatType.PRIVATE:
+        text, markup = await S.logs_screen(db, chat, settings, 0)
+        await message.answer(text, reply_markup=markup)
+        return
     await message.reply(await logs_text(db, chat, settings))
-
-
-async def logs_text(db: Database, chat: Chat, settings: Settings) -> str:
-    rows = await db.recent_logs(chat.chat_id, 15)
-    if not rows:
-        return f"📜 <b>Activity — {escape(chat.display)}</b>\n\n<i>Nothing recorded yet.</i>"
-    lines = [f"📜 <b>Activity — {escape(chat.display)}</b>", ""]
-    for r in rows:
-        ts = format_dt(datetime.fromisoformat(r["created_at"]), settings.tz)
-        who = f"<code>{r['user_id']}</code> " if r["user_id"] else ""
-        det = f" <i>{escape(str(r['details']))[:40]}</i>" if r["details"] else ""
-        lines.append(f"• {ts} — <b>{escape(r['action'])}</b> {who}{det}")
-    return "\n".join(lines)
 
 
 @router.message(Command("gstats", "globalstats"))
@@ -754,14 +704,12 @@ async def cmd_pending(
     chat = await resolve_chat(message, bot, db, settings)
     if not chat:
         return
-    from bot.handlers.callbacks import pending_text  # local import avoids a cycle
-
-    text, ids = await pending_text(db, chat, settings)
+    text, markup = await S.pending_screen(db, chat, settings)
     if message.chat.type != ChatType.PRIVATE:
         me = await bot.me()
         await message.reply(text, reply_markup=open_private_keyboard(me.username or ""))
         return
-    await message.answer(text, reply_markup=pending_keyboard(chat.chat_id, ids))
+    await message.answer(text, reply_markup=markup)
 
 
 @router.message(Command("ask"))
@@ -818,11 +766,8 @@ async def cmd_invite(
     if not url:
         await message.reply(f"❌ {escape(msg)}")
         return
-    await message.reply(
-        f"🔗 <b>Invite link created</b>\n\n"
-        f"📛 {escape(msg)} · ⏳ <b>{escape(describe_duration(duration))}</b>\n\n"
-        f"<code>{escape(url)}</code>"
-    )
+    text, markup = S.invite_created_screen(chat, url, msg, duration)
+    await message.reply(text, reply_markup=markup if message.chat.type == ChatType.PRIVATE else None)
 
 
 @router.message(Command("invites", "links"))
@@ -830,17 +775,16 @@ async def cmd_invites(message: Message, bot: Bot, db: Database, settings: Settin
     chat = await resolve_chat(message, bot, db, settings)
     if not chat:
         return
-    from bot.handlers.callbacks import invites_text  # local import avoids a cycle
-
-    links = await db.list_invite_links(chat.chat_id)
     if message.chat.type != ChatType.PRIVATE:
+        links = await db.list_invite_links(chat.chat_id)
         me = await bot.me()
         await message.reply(
             f"🔗 {len(links)} active invite link(s). Manage them privately.",
             reply_markup=open_private_keyboard(me.username or ""),
         )
         return
-    await message.answer(invites_text(chat, links), reply_markup=invites_keyboard(chat, links))
+    text, markup = await S.invites_screen(db, chat)
+    await message.answer(text, reply_markup=markup)
 
 
 @router.message(Command("revoke"))
@@ -881,6 +825,10 @@ async def cmd_search(
     query = (command.args or "").strip()
     if len(query) < 2:
         await _usage(message, "/search &lt;name | @username | id&gt;")
+        return
+    if message.chat.type == ChatType.PRIVATE:
+        text, markup = await S.members_screen(db, chat, settings, "active", 0, query=query[:64])
+        await message.answer(text, reply_markup=markup)
         return
     found = await db.search_members(chat.chat_id, query, limit=15)
     if not found:
