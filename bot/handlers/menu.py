@@ -26,7 +26,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from bot.config import Settings
-from bot.handlers.admin import dashboard_text, list_text, settings_text
+from bot.handlers import screens as S
 from bot.handlers.common import HELP_TOPICS, _is_admin_user, home_text, mystatus_text
 from bot.services.database import Chat, Database
 from bot.utils import keyboards as K
@@ -63,10 +63,8 @@ async def _selected_chat(
         await db.set_context(user_id, current)
     chat = await db.get_chat(current) if current is not None else None
     if chat is None or not await is_admin(bot, db, settings, chat.chat_id, user_id):
-        await message.answer(
-            "📂 <b>Your chats</b>\nChoose one to manage:",
-            reply_markup=K.chats_keyboard(chats, None),
-        )
+        text, markup = await S.chats_screen(db, chats, None)
+        await message.answer(text, reply_markup=markup)
         return None
     return chat
 
@@ -100,7 +98,8 @@ async def menu_chats(message: Message, bot: Bot, db: Database, settings: Setting
         await _no_chats(message, bot, db, settings)
         return
     current = await db.get_context(message.from_user.id)
-    await message.answer("📂 <b>Your chats</b>\nChoose one to manage:", reply_markup=K.chats_keyboard(chats, current))
+    text, markup = await S.chats_screen(db, chats, current)
+    await message.answer(text, reply_markup=markup)
 
 
 @router.message(*_tap(K.MENU_DASHBOARD))
@@ -109,8 +108,9 @@ async def menu_dashboard(message: Message, bot: Bot, db: Database, settings: Set
     chat = await _selected_chat(message, bot, db, settings)
     if not chat:
         return
-    pending = await db.count_pending(chat.chat_id)
-    await message.answer(await dashboard_text(db, chat, settings), reply_markup=K.dashboard_keyboard(chat, pending))
+    many = len(await _admin_chats(db, settings, message.from_user.id)) > 1
+    text, markup = await S.dashboard_screen(db, chat, settings, many)
+    await message.answer(text, reply_markup=markup)
 
 
 @router.message(*_tap(K.MENU_MEMBERS))
@@ -119,8 +119,8 @@ async def menu_members(message: Message, bot: Bot, db: Database, settings: Setti
     chat = await _selected_chat(message, bot, db, settings)
     if not chat:
         return
-    text, has_next = await list_text(db, chat, settings, 0)
-    await message.answer(text, reply_markup=K.list_keyboard(chat.chat_id, 0, has_next))
+    text, markup = await S.members_screen(db, chat, settings, "active", 0)
+    await message.answer(text, reply_markup=markup)
 
 
 @router.message(*_tap(K.MENU_PENDING))
@@ -129,10 +129,8 @@ async def menu_pending(message: Message, bot: Bot, db: Database, settings: Setti
     chat = await _selected_chat(message, bot, db, settings)
     if not chat:
         return
-    from bot.handlers.callbacks import pending_text  # local import avoids a cycle
-
-    text, ids = await pending_text(db, chat, settings)
-    await message.answer(text, reply_markup=K.pending_keyboard(chat.chat_id, ids))
+    text, markup = await S.pending_screen(db, chat, settings)
+    await message.answer(text, reply_markup=markup)
 
 
 @router.message(*_tap(K.MENU_INVITES))
@@ -141,10 +139,8 @@ async def menu_invites(message: Message, bot: Bot, db: Database, settings: Setti
     chat = await _selected_chat(message, bot, db, settings)
     if not chat:
         return
-    from bot.handlers.callbacks import invites_text  # local import avoids a cycle
-
-    links = await db.list_invite_links(chat.chat_id)
-    await message.answer(invites_text(chat, links), reply_markup=K.invites_keyboard(chat, links))
+    text, markup = await S.invites_screen(db, chat)
+    await message.answer(text, reply_markup=markup)
 
 
 @router.message(*_tap(K.MENU_SETTINGS))
@@ -153,10 +149,8 @@ async def menu_settings(message: Message, bot: Bot, db: Database, settings: Sett
     chat = await _selected_chat(message, bot, db, settings)
     if not chat:
         return
-    await message.answer(
-        settings_text(chat, settings),
-        reply_markup=K.settings_keyboard(chat, settings.default_duration, settings.ask_on_join_default),
-    )
+    text, markup = S.settings_screen(chat, settings)
+    await message.answer(text, reply_markup=markup)
 
 
 @router.message(*_tap(K.MENU_HELP))
@@ -168,7 +162,7 @@ async def menu_help(message: Message, state: FSMContext) -> None:
 @router.message(*_tap(K.MENU_STATUS))
 async def menu_status(message: Message, db: Database, settings: Settings, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(await mystatus_text(db, settings, message.from_user.id))
+    await message.answer(await mystatus_text(db, settings, message.from_user.id), reply_markup=K.mystatus_keyboard())
 
 
 @router.message(*_tap(K.MENU_ADD))

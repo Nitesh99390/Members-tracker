@@ -1,13 +1,18 @@
 """Inline keyboard builders.
 
 Design rules (keep the bot feeling clean and professional):
-* one screen = one job, never more than ~6 buttons unless it is a list
+* one screen = one job, never more than ~8 buttons unless it is a list
 * primary action first, destructive action last
-* every screen has a single obvious "back" target
+* every screen has a single obvious "back" target and a 🏠 escape hatch
+* lists are *tappable*: a row opens the item, no IDs to type
+* the currently selected option is marked with ``▸`` / ``✓`` so state is visible
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from aiogram.types import (
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -16,7 +21,8 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
-from bot.services.database import Chat, InviteLink
+from bot.services.database import Chat, InviteLink, Member, PendingJoin
+from bot.utils.ui import clip, page_label, short_delta, urgency
 
 # Full list of presets (used by "more options" screens)
 DURATION_PRESETS: tuple[tuple[str, str], ...] = (
@@ -35,6 +41,17 @@ _PRESET_LABEL = dict((v, k) for k, v in DURATION_PRESETS)
 # quick row never duplicates the "approve with default" button.
 QUICK_DURATIONS: tuple[str, ...] = ("1m", "3m", "1y", "6m", "1w", "never")
 
+#: Member list views: key → (label, icon). Order = tab order.
+MEMBER_VIEWS: tuple[tuple[str, str, str], ...] = (
+    ("active", "Active", "🟢"),
+    ("soon", "Expiring", "⏰"),
+    ("lifetime", "Lifetime", "♾"),
+    ("past", "Past", "📁"),
+)
+
+#: Telegram caps button labels at 64 chars; keep names short so counters fit.
+BTN_NAME = 26
+
 
 def _btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=data)
@@ -42,6 +59,10 @@ def _btn(text: str, data: str) -> InlineKeyboardButton:
 
 def _url(text: str, url: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, url=url)
+
+
+def _copy(text: str, payload: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, copy_text=CopyTextButton(text=payload[:256]))
 
 
 def onoff(flag: bool) -> str:
@@ -55,6 +76,14 @@ def preset_label(value: str) -> str:
 def quick_durations(exclude: str | None, count: int = 3) -> list[str]:
     out = [v for v in QUICK_DURATIONS if v != exclude]
     return out[:count]
+
+
+def _nav(*buttons: InlineKeyboardButton) -> list[InlineKeyboardButton]:
+    return list(buttons)
+
+
+def _home() -> InlineKeyboardButton:
+    return _btn("🏠", "home")
 
 
 # ------------------------------------------------------------ reply keyboard
@@ -108,7 +137,7 @@ def main_menu_keyboard(is_admin: bool, has_chats: bool) -> ReplyKeyboardMarkup:
         kb.row(_kbtn(MENU_PENDING), _kbtn(MENU_INVITES))
         kb.row(_kbtn(MENU_SETTINGS), _kbtn(MENU_CHATS))
         kb.row(_kbtn(MENU_HELP))
-        placeholder = "Pick an action or send a user ID / @username"
+        placeholder = "Tap a button, or send a user ID / @username / name"
     elif is_admin:
         kb.row(_kbtn(MENU_ADD), _kbtn(MENU_HELP))
         placeholder = "Add me to a group to get started"
@@ -176,26 +205,52 @@ def open_private_keyboard(bot_username: str, text: str = "💬 Open dashboard") 
 
 
 # ------------------------------------------------------------------ chat pick
-def chats_keyboard(chats: list[Chat], current: int | None) -> InlineKeyboardMarkup:
+def chats_keyboard(
+    chats: list[Chat], current: int | None, badges: dict[int, tuple[int, int]] | None = None
+) -> InlineKeyboardMarkup:
+    """One row per chat. ``badges`` = {chat_id: (active_members, pending)} adds live counters."""
     kb = InlineKeyboardBuilder()
     for chat in chats:
         prefix = "▸ " if chat.chat_id == current else ""
         icon = "📢" if chat.is_channel else "👥"
-        state = "" if chat.tracking_enabled else " · paused"
-        kb.row(_btn(f"{prefix}{icon} {chat.display[:36]}{state}", f"dash:{chat.chat_id}"))
+        state = "" if chat.tracking_enabled else " · ⏸"
+        extra = ""
+        if badges and chat.chat_id in badges:
+            active, pending = badges[chat.chat_id]
+            extra = f" · {active}"
+            if pending:
+                extra += f" · 🔔{pending}"
+        kb.row(_btn(f"{prefix}{icon} {clip(chat.display, 30)}{state}{extra}", f"dash:{chat.chat_id}"))
     kb.row(_btn("🏠 Home", "home"))
     return kb.as_markup()
 
 
 # ------------------------------------------------------------------ dashboard
-def dashboard_keyboard(chat: Chat, pending: int = 0) -> InlineKeyboardMarkup:
+def dashboard_keyboard(chat: Chat, pending: int = 0, expiring: int = 0, many_chats: bool = True) -> InlineKeyboardMarkup:
     cid = chat.chat_id
-    pend = f"🔔 Pending ({pending})" if pending else "🔔 Pending"
+    pend = f"🔔 Pending · {pending}" if pending else "🔔 Pending"
+    soon = f"⏰ Expiring · {expiring}" if expiring else "⏰ Expiring"
     kb = InlineKeyboardBuilder()
-    kb.row(_btn("👥 Members", f"list:{cid}:0"), _btn("📊 Overview", f"stats:{cid}"))
+    kb.row(_btn("👥 Members", f"list:{cid}:active:0"), _btn(soon, f"list:{cid}:soon:0"))
     kb.row(_btn(pend, f"pending:{cid}"), _btn("🔗 Invite links", f"invites:{cid}"))
-    kb.row(_btn("⚙️ Settings", f"settings:{cid}"), _btn("📜 Activity", f"logs:{cid}"))
-    kb.row(_btn("◀️ Chats", "chats"))
+    kb.row(_btn("📊 Overview", f"stats:{cid}"), _btn("📜 Activity", f"logs:{cid}"))
+    kb.row(_btn("⚙️ Settings", f"settings:{cid}"), _btn("🛠 Tools", f"tools:{cid}"))
+    if many_chats:
+        kb.row(_btn("◀️ Chats", "chats"), _home())
+    else:
+        kb.row(_btn("🏠 Home", "home"))
+    return kb.as_markup()
+
+
+def tools_keyboard(chat: Chat) -> InlineKeyboardMarkup:
+    """Rarely used, powerful actions — kept off the dashboard to keep it calm."""
+    cid = chat.chat_id
+    kb = InlineKeyboardBuilder()
+    kb.row(_btn("➕ Add member", f"addm:{cid}"), _btn("🔍 Search", f"search:{cid}"))
+    kb.row(_btn("📣 Broadcast", f"bcast:{cid}"), _btn("🛡 VIP list", f"vips:{cid}"))
+    kb.row(_btn("🔄 Sync with Telegram", f"sync:{cid}"), _btn("🔁 Run expiry check", f"fcheck:{cid}"))
+    kb.row(_btn("🔐 Check permissions", f"perms:{cid}"))
+    kb.row(_btn("◀️ Dashboard", f"dash:{cid}"), _home())
     return kb.as_markup()
 
 
@@ -214,14 +269,15 @@ def settings_keyboard(chat: Chat, default_duration: str, ask_default: bool) -> I
         _btn(f"{onoff(ask_state)} Ask on join", f"set:{cid}:ask"),
         _btn(f"{'🔨 Ban' if chat.kick_mode == 'ban' else '👢 Kick'} mode", f"set:{cid}:mode"),
     )
-    kb.row(_btn("🔧 Advanced", f"adv:{cid}"), _btn("◀️ Dashboard", f"dash:{cid}"))
+    kb.row(_btn("🔧 Advanced", f"adv:{cid}"))
+    kb.row(_btn("◀️ Dashboard", f"dash:{cid}"), _home())
     return kb.as_markup()
 
 
 def advanced_keyboard(chat: Chat) -> InlineKeyboardMarkup:
     cid = chat.chat_id
-    approve = {0: "❌ Join requests", 1: "✅ Auto-approve requests", 2: "🔔 Ask on requests"}.get(
-        chat.approve_requests, "❌ Join requests"
+    approve = {0: "🙋 Requests · ignore", 1: "🙋 Requests · auto-approve", 2: "🙋 Requests · ask me"}.get(
+        chat.approve_requests, "🙋 Requests · ignore"
     )
     kb = InlineKeyboardBuilder()
     kb.row(
@@ -229,17 +285,31 @@ def advanced_keyboard(chat: Chat) -> InlineKeyboardMarkup:
         _btn(f"{onoff(chat.welcome_enabled)} Welcome", f"set:{cid}:welcome"),
     )
     kb.row(_btn(approve, f"set:{cid}:approve"))
-    kb.row(_btn(f"Prompts → {'👑 Owner' if chat.ask_target == 'owner' else '👮 All admins'}", f"set:{cid}:asktarget"))
-    kb.row(_btn("◀️ Settings", f"settings:{cid}"))
+    kb.row(_btn(f"🔔 Prompts → {'👑 Owner' if chat.ask_target == 'owner' else '👮 All admins'}", f"set:{cid}:asktarget"))
+    kb.row(_btn("✏️ Welcome text", f"edit:{cid}:welcome"), _btn("📨 Log channel", f"edit:{cid}:log"))
+    kb.row(_btn("◀️ Settings", f"settings:{cid}"), _home())
     return kb.as_markup()
 
 
-def duration_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+def duration_keyboard(chat_id: int, current: str | None = None) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for label, value in DURATION_PRESETS:
-        kb.button(text=label, callback_data=f"dur:{chat_id}:{value}")
+        mark = "✓ " if current == value else ""
+        kb.button(text=f"{mark}{label}", callback_data=f"dur:{chat_id}:{value}")
     kb.adjust(3)
-    kb.row(_btn("🌐 Global default", f"dur:{chat_id}:global"), _btn("◀️ Back", f"settings:{chat_id}"))
+    kb.row(_btn("✏️ Custom", f"dur:{chat_id}:custom"), _btn("🌐 Global default", f"dur:{chat_id}:global"))
+    kb.row(_btn("◀️ Settings", f"settings:{chat_id}"))
+    return kb.as_markup()
+
+
+def edit_text_keyboard(chat_id: int, kind: str, has_value: bool) -> InlineKeyboardMarkup:
+    """Keyboard for the welcome-text / log-channel editors."""
+    kb = InlineKeyboardBuilder()
+    if has_value:
+        kb.row(_btn("🗑 Clear", f"editclr:{chat_id}:{kind}"))
+    if kind == "log":
+        kb.row(_btn("📨 Use this chat", f"editlog:{chat_id}:here"))
+    kb.row(_btn("◀️ Advanced", f"adv:{chat_id}"))
     return kb.as_markup()
 
 
@@ -278,32 +348,40 @@ def join_remove_confirm_keyboard(pending_id: int, is_request: bool = False) -> I
     return kb.as_markup()
 
 
-def cancel_keyboard(data: str = "cancel") -> InlineKeyboardMarkup:
+def cancel_keyboard(data: str = "cancel", label: str = "❌ Cancel") -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.row(_btn("❌ Cancel", data))
+    kb.row(_btn(label, data))
     return kb.as_markup()
 
 
 # ---------------------------------------------------------------- member card
-def member_keyboard(chat_id: int, user_id: int, is_active: bool) -> InlineKeyboardMarkup:
+def member_keyboard(
+    chat_id: int, user_id: int, is_active: bool, back_view: str = "active", back_page: int = 0
+) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(
+        _btn("+1 week", f"ext:{chat_id}:{user_id}:1w"),
         _btn("+1 month", f"ext:{chat_id}:{user_id}:1m"),
         _btn("+3 months", f"ext:{chat_id}:{user_id}:3m"),
-        _btn("♾ Lifetime", f"ext:{chat_id}:{user_id}:never"),
     )
-    kb.row(_btn("✏️ Custom", f"cust:{chat_id}:{user_id}"), _btn("⋯ More", f"more:{chat_id}:{user_id}"))
-    kb.row(_btn("◀️ Members", f"list:{chat_id}:0"))
+    kb.row(
+        _btn("♾ Lifetime", f"ext:{chat_id}:{user_id}:never"),
+        _btn("✏️ Custom", f"cust:{chat_id}:{user_id}"),
+        _btn("⋯ More", f"more:{chat_id}:{user_id}"),
+    )
+    kb.row(_btn("◀️ Members", f"list:{chat_id}:{back_view}:{back_page}"), _btn("📊", f"dash:{chat_id}"))
     return kb.as_markup()
 
 
 def member_more_keyboard(chat_id: int, user_id: int, is_active: bool, whitelisted: bool) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.row(_btn("+1 week", f"ext:{chat_id}:{user_id}:1w"), _btn("+6 months", f"ext:{chat_id}:{user_id}:6m"))
+    kb.row(_btn("+6 months", f"ext:{chat_id}:{user_id}:6m"), _btn("+1 year", f"ext:{chat_id}:{user_id}:1y"))
     kb.row(
         _btn("📜 History", f"hist:{chat_id}:{user_id}"),
-        _btn("🛡 Unprotect" if whitelisted else "🛡 Protect (VIP)", f"wl:{chat_id}:{user_id}"),
+        _btn("📝 Note", f"note:{chat_id}:{user_id}"),
+        _btn("🔔 Ask owner", f"askm:{chat_id}:{user_id}"),
     )
+    kb.row(_btn("🛡 Unprotect" if whitelisted else "🛡 Protect (VIP)", f"wl:{chat_id}:{user_id}"))
     if is_active:
         kb.row(_btn("🚫 Remove from chat", f"kick:{chat_id}:{user_id}"))
     kb.row(_btn("🗑 Stop tracking", f"untrack:{chat_id}:{user_id}"))
@@ -311,22 +389,82 @@ def member_more_keyboard(chat_id: int, user_id: int, is_active: bool, whiteliste
     return kb.as_markup()
 
 
-def list_keyboard(chat_id: int, page: int, has_next: bool) -> InlineKeyboardMarkup:
+def _member_row_label(m: Member, now: datetime) -> str:
+    glyph = urgency(m.expires_at, now)
+    if m.expires_at is None:
+        tail = "∞"
+    elif m.status != "active":
+        tail = m.status
+    else:
+        tail = short_delta(m.expires_at - now)
+    name = clip(m.full_name or (f"@{m.username}" if m.username else str(m.user_id)), BTN_NAME)
+    return f"{glyph} {name} · {tail}"
+
+
+def list_keyboard(
+    chat_id: int,
+    view: str,
+    page: int,
+    total_pages: int,
+    members: list[Member],
+    counts: dict[str, int] | None = None,
+    query: str | None = None,
+) -> InlineKeyboardMarkup:
+    """Tappable member list with view tabs, pager and search."""
+    now = datetime.now(timezone.utc)
     kb = InlineKeyboardBuilder()
-    nav: list[InlineKeyboardButton] = []
-    if page > 0:
-        nav.append(_btn("◀️", f"list:{chat_id}:{page - 1}"))
-    nav.append(_btn(f"Page {page + 1}", "noop"))
-    if has_next:
-        nav.append(_btn("▶️", f"list:{chat_id}:{page + 1}"))
-    kb.row(*nav)
-    kb.row(_btn("◀️ Dashboard", f"dash:{chat_id}"))
+    # tabs (current one marked, counts inline)
+    tabs = []
+    for key, label, icon in MEMBER_VIEWS:
+        n = (counts or {}).get(key)
+        txt = f"{icon} {label}" + (f" {n}" if n is not None else "")
+        if key == view and not query:
+            txt = f"▸ {txt}"
+        tabs.append(_btn(txt, f"list:{chat_id}:{key}:0"))
+    kb.row(*tabs[:2])
+    kb.row(*tabs[2:])
+    # rows
+    for m in members:
+        kb.row(_btn(_member_row_label(m, now), f"member:{chat_id}:{m.user_id}:{view}:{page}"))
+    # pager
+    if total_pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        nav.append(_btn("◀️", f"list:{chat_id}:{view}:{page - 1}") if page > 0 else _btn("·", "noop"))
+        nav.append(_btn(page_label(page, total_pages), "noop"))
+        nav.append(_btn("▶️", f"list:{chat_id}:{view}:{page + 1}") if page < total_pages - 1 else _btn("·", "noop"))
+        kb.row(*nav)
+    if query:
+        kb.row(_btn("✖️ Clear search", f"list:{chat_id}:active:0"), _btn("🔍 Search again", f"search:{chat_id}"))
+    else:
+        kb.row(_btn("🔍 Search", f"search:{chat_id}"), _btn("➕ Add member", f"addm:{chat_id}"))
+    kb.row(_btn("◀️ Dashboard", f"dash:{chat_id}"), _home())
     return kb.as_markup()
 
 
 def back_keyboard(chat_id: int, label: str = "◀️ Dashboard") -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.row(_btn(label, f"dash:{chat_id}"))
+    kb.row(_btn(label, f"dash:{chat_id}"), _home())
+    return kb.as_markup()
+
+
+def stats_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(_btn("⏰ Expiring soon", f"list:{chat_id}:soon:0"), _btn("📁 Past members", f"list:{chat_id}:past:0"))
+    kb.row(_btn("🔄 Refresh", f"stats:{chat_id}"))
+    kb.row(_btn("◀️ Dashboard", f"dash:{chat_id}"), _home())
+    return kb.as_markup()
+
+
+def logs_keyboard(chat_id: int, page: int, has_next: bool) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(_btn("◀️ Newer", f"logs:{chat_id}:{page - 1}"))
+    if has_next:
+        nav.append(_btn("Older ▶️", f"logs:{chat_id}:{page + 1}"))
+    if nav:
+        kb.row(*nav)
+    kb.row(_btn("◀️ Dashboard", f"dash:{chat_id}"), _home())
     return kb.as_markup()
 
 
@@ -339,12 +477,22 @@ def confirm_keyboard(action: str, chat_id: int, user_id: int) -> InlineKeyboardM
     return kb.as_markup()
 
 
-def pending_keyboard(chat_id: int, pending_ids: list[int]) -> InlineKeyboardMarkup:
+def pending_keyboard(chat_id: int, items: list[PendingJoin]) -> InlineKeyboardMarkup:
+    """One tappable row per waiting member plus a bulk 'keep default for all'."""
     kb = InlineKeyboardBuilder()
-    for pid in pending_ids[:12]:
-        kb.button(text=f"#{pid}", callback_data=f"jb:{pid}")
-    kb.adjust(4)
-    kb.row(_btn("◀️ Dashboard", f"dash:{chat_id}"))
+    for p in items[:10]:
+        icon = "🙋" if p.source == "request" else "👤"
+        kb.row(_btn(f"{icon} {clip(p.full_name or str(p.user_id), BTN_NAME + 6)}", f"jb:{p.id}"))
+    if len(items) > 1:
+        kb.row(_btn(f"✅ Default for all ({len(items)})", f"pall:{chat_id}"))
+    kb.row(_btn("🔄 Refresh", f"pending:{chat_id}"))
+    kb.row(_btn("◀️ Dashboard", f"dash:{chat_id}"), _home())
+    return kb.as_markup()
+
+
+def pending_all_confirm_keyboard(chat_id: int, count: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(_btn(f"✅ Yes, apply default to {count}", f"pallc:{chat_id}"), _btn("◀️ Back", f"pending:{chat_id}"))
     return kb.as_markup()
 
 
@@ -354,13 +502,20 @@ def invites_keyboard(chat: Chat, links: list[InviteLink]) -> InlineKeyboardMarku
     kb = InlineKeyboardBuilder()
     kb.row(_btn("➕ New link", f"inpick:{cid}"))
     for link in links[:8]:
+        label = clip(link.name or preset_label(link.duration), 18)
         kb.row(
-            _btn(
-                f"🗑 {(link.name or preset_label(link.duration))[:24]} · {link.uses} joined",
-                f"irev:{cid}:{link.invite_link[-22:]}",
-            )
+            _copy(f"📋 {label} · {link.uses}", link.invite_link),
+            _btn("🗑", f"irev:{cid}:{link.invite_link[-22:]}"),
         )
-    kb.row(_btn("◀️ Dashboard", f"dash:{cid}"))
+    kb.row(_btn("◀️ Dashboard", f"dash:{cid}"), _home())
+    return kb.as_markup()
+
+
+def invite_created_keyboard(chat_id: int, url: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(_copy("📋 Copy link", url))
+    kb.row(_url("📤 Share", f"https://t.me/share/url?url={url}"))
+    kb.row(_btn("◀️ Invite links", f"invites:{chat_id}"))
     return kb.as_markup()
 
 
@@ -369,5 +524,36 @@ def invite_pick_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     for label, value in DURATION_PRESETS:
         kb.button(text=label, callback_data=f"inew:{chat_id}:{value}")
     kb.adjust(4)
+    kb.row(_btn("✏️ Custom duration + label", f"incust:{chat_id}"))
     kb.row(_btn("◀️ Back", f"invites:{chat_id}"))
+    return kb.as_markup()
+
+
+def invite_revoke_confirm_keyboard(chat_id: int, suffix: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(_btn("✅ Yes, revoke", f"irevc:{chat_id}:{suffix}"), _btn("◀️ Back", f"invites:{chat_id}"))
+    return kb.as_markup()
+
+
+# ------------------------------------------------------------------- tools
+def broadcast_confirm_keyboard(chat_id: int, count: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(_btn(f"📣 Send to {count}", f"bcastc:{chat_id}"), _btn("❌ Cancel", f"tools:{chat_id}"))
+    return kb.as_markup()
+
+
+def vips_keyboard(chat_id: int, members: list[Member], ids: list[int]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    known = {m.user_id: m for m in members}
+    for uid in ids[:12]:
+        m = known.get(uid)
+        label = clip(m.full_name, BTN_NAME) if m and m.full_name else str(uid)
+        kb.row(_btn(f"🛡 {label}", f"member:{chat_id}:{uid}"))
+    kb.row(_btn("◀️ Tools", f"tools:{chat_id}"), _home())
+    return kb.as_markup()
+
+
+def mystatus_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(_btn("🔄 Refresh", "mystatus"), _btn("🏠 Home", "home"))
     return kb.as_markup()

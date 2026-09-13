@@ -5,7 +5,7 @@ import asyncio
 import logging
 import shutil
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -677,6 +677,64 @@ class Database:
         rows = await self._fetchall(sql, params)
         return [Member.from_row(r) for r in rows]
 
+    # Named views used by the members screen. Each maps to a WHERE fragment that
+    # is appended to ``chat_id=?``; ``:now`` is substituted with the current time.
+    MEMBER_FILTERS: dict[str, str] = {
+        "active": "status='active'",
+        "soon": "status='active' AND expires_at IS NOT NULL AND expires_at <= :soon",
+        "lifetime": "status='active' AND expires_at IS NULL",
+        "past": "status<>'active'",
+        "all": "1=1",
+    }
+
+    def _filter_sql(self, view: str, soon: datetime | None) -> tuple[str, list[Any]]:
+        frag = self.MEMBER_FILTERS.get(view, self.MEMBER_FILTERS["active"])
+        params: list[Any] = []
+        if ":soon" in frag:
+            frag = frag.replace(":soon", "?")
+            params.append(to_iso(soon or (utcnow() + timedelta(days=7))))
+        return frag, params
+
+    async def list_members_view(
+        self,
+        chat_id: int,
+        view: str = "active",
+        limit: int = 50,
+        offset: int = 0,
+        query: str | None = None,
+        soon: datetime | None = None,
+    ) -> tuple[list[Member], int]:
+        """Filtered, paged member list. Returns ``(rows, total_matching)``.
+
+        ``view`` is one of :attr:`MEMBER_FILTERS`; ``query`` narrows by
+        name / username / user-id substring.
+        """
+        frag, params = self._filter_sql(view, soon)
+        where = f"chat_id=? AND {frag}"
+        args: list[Any] = [chat_id, *params]
+        if query:
+            like = f"%{query.lstrip('@')}%"
+            where += " AND (full_name LIKE ? OR username LIKE ? OR CAST(user_id AS TEXT) LIKE ?)"
+            args += [like, like, like]
+        order = "updated_at DESC" if view == "past" else "expires_at IS NULL, expires_at ASC"
+        rows = await self._fetchall(
+            f"SELECT * FROM members WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+            [*args, limit, offset],
+        )
+        count_row = await self._fetchone(f"SELECT COUNT(*) FROM members WHERE {where}", args)
+        return [Member.from_row(r) for r in rows], (int(count_row[0]) if count_row else 0)
+
+    async def member_view_counts(self, chat_id: int, soon: datetime | None = None) -> dict[str, int]:
+        """Counts for every named view in one round-trip each (cheap, indexed)."""
+        out: dict[str, int] = {}
+        for view in ("active", "soon", "lifetime", "past"):
+            frag, params = self._filter_sql(view, soon)
+            row = await self._fetchone(
+                f"SELECT COUNT(*) FROM members WHERE chat_id=? AND {frag}", [chat_id, *params]
+            )
+            out[view] = int(row[0]) if row else 0
+        return out
+
     async def iter_all_members(self, chat_id: int) -> list[Member]:
         rows = await self._fetchall(
             "SELECT * FROM members WHERE chat_id=? ORDER BY joined_at", (chat_id,)
@@ -846,6 +904,11 @@ class Database:
     async def recent_logs(self, chat_id: int, limit: int = 15) -> list[aiosqlite.Row]:
         return await self._fetchall(
             "SELECT * FROM logs WHERE chat_id=? ORDER BY id DESC LIMIT ?", (chat_id, limit)
+        )
+
+    async def recent_logs_page(self, chat_id: int, limit: int = 15, offset: int = 0) -> list[aiosqlite.Row]:
+        return await self._fetchall(
+            "SELECT * FROM logs WHERE chat_id=? ORDER BY id DESC LIMIT ? OFFSET ?", (chat_id, limit, offset)
         )
 
     async def user_logs(self, chat_id: int, user_id: int, limit: int = 10) -> list[aiosqlite.Row]:
