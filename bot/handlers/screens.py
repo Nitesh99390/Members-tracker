@@ -151,6 +151,9 @@ def advanced_screen(chat: Chat) -> Screen:
         else "<b>off</b> · removed right at expiry"
     )
     digest = "<b>on</b> · one DM per day listing members expiring soon" if chat.digest_enabled else "<b>off</b>"
+    renewals = (
+        "<b>on</b> · members can tap 🙏 to ask you for more time" if chat.renewals_enabled else "<b>off</b>"
+    )
     text = (
         f"🔧 <b>Advanced — {escape(chat.display)}</b>\n\n"
         f"💬 Member DMs (reminders, notices): <b>{'on' if chat.notify_user else 'off'}</b>\n"
@@ -159,6 +162,7 @@ def advanced_screen(chat: Chat) -> Screen:
         f"🔔 Prompts go to: <b>{'the owner' if chat.ask_target == 'owner' else 'all admins'}</b>\n"
         f"⏱ Grace period: {grace}\n"
         f"📬 Daily digest: {digest}\n"
+        f"🙏 Renewal requests: {renewals}\n"
         f"📨 Log channel: <b>{log}</b>"
     )
     return text, K.advanced_keyboard(chat)
@@ -333,7 +337,7 @@ async def pending_screen(db: Database, chat: Chat, settings: Settings) -> Screen
         now = datetime.now(settings.tz)
         for p in items[:10]:
             age = humanize_delta(now - p.created_at.astimezone(settings.tz))
-            kind = "requested to join" if p.source == "request" else "joined"
+            kind = {"request": "requested to join", "renewal": "asked for a renewal"}.get(p.source, "joined")
             lines.append(f"• {p.mention_html} · <code>{p.user_id}</code> · {kind} {age} ago")
         if len(items) > 10:
             lines.append(f"<i>…and {len(items) - 10} more</i>")

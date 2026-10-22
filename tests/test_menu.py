@@ -12,6 +12,7 @@ from bot.config import Settings
 from bot.handlers import menu
 from bot.handlers.common import home_text
 from bot.services.database import Database
+from bot.services.membership import MembershipService
 from bot.utils import keyboards as K
 
 
@@ -111,7 +112,8 @@ async def test_help_and_status_work_for_everyone(env):
     state.clear.assert_awaited_once()
 
     m = _msg(K.MENU_STATUS, uid=42)
-    await menu.menu_status(m, db, settings, _state())
+    service = MembershipService(_bot, db, settings)
+    await menu.menu_status(m, db, settings, service, _state())
     assert "no tracked memberships" in _sent(m)[0][0]
 
 

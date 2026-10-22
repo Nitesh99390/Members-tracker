@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS pending_joins (
     user_id     INTEGER NOT NULL,
     full_name   TEXT,
     username    TEXT,
-    source      TEXT NOT NULL DEFAULT 'join',   -- join | request | manual
+    source      TEXT NOT NULL DEFAULT 'join',   -- join | request | manual | renewal
     status      TEXT NOT NULL DEFAULT 'pending', -- pending | decided | expired | cancelled
     created_at  TEXT NOT NULL,
     decided_at  TEXT,
@@ -143,6 +143,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("chats", "owner_id", "INTEGER"),
     ("chats", "grace_hours", "INTEGER NOT NULL DEFAULT 0"),  # grace after expiry before removal
     ("chats", "digest_enabled", "INTEGER NOT NULL DEFAULT 0"),  # daily "expiring soon" DM to admins
+    ("chats", "renewals_enabled", "INTEGER NOT NULL DEFAULT 1"),  # members may tap "Request renewal"
     ("members", "fail_count", "INTEGER NOT NULL DEFAULT 0"),
     ("members", "source", "TEXT"),  # join | request | invite:<link> | manual
     ("members", "renewals", "INTEGER NOT NULL DEFAULT 0"),
@@ -204,10 +205,12 @@ class Chat:
     owner_id: int | None = None
     grace_hours: int = 0
     digest_enabled: bool = False
+    renewals_enabled: bool = True
 
     @classmethod
     def from_row(cls, row: aiosqlite.Row) -> Chat:
         ask = _row_get(row, "ask_on_join")
+        renew = _row_get(row, "renewals_enabled", 1)
         return cls(
             chat_id=row["chat_id"],
             title=row["title"],
@@ -228,6 +231,7 @@ class Chat:
             owner_id=_row_get(row, "owner_id"),
             grace_hours=int(_row_get(row, "grace_hours", 0) or 0),
             digest_enabled=bool(_row_get(row, "digest_enabled", 0) or 0),
+            renewals_enabled=True if renew is None else bool(renew),
         )
 
     @property
@@ -1026,6 +1030,15 @@ class Database:
             (status, to_iso(utcnow()), decided_by, decision[:100], pending_id),
         )
         return rows > 0
+
+    async def last_pending(self, chat_id: int, user_id: int, source: str) -> PendingJoin | None:
+        """Most recent record of ``source`` for this user/chat regardless of status (for cooldowns)."""
+        row = await self._fetchone(
+            """SELECT * FROM pending_joins WHERE chat_id=? AND user_id=? AND source=?
+               ORDER BY id DESC LIMIT 1""",
+            (chat_id, user_id, source),
+        )
+        return PendingJoin.from_row(row) if row else None
 
     async def stale_pending(self, older_than: datetime) -> list[PendingJoin]:
         rows = await self._fetchall(

@@ -12,15 +12,17 @@ from html import escape
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import InlineKeyboardMarkup, Message
 
 from bot import VERSION_TAG
 from bot.config import Settings
 from bot.services.database import Database
+from bot.services.membership import MembershipService
 from bot.utils.keyboards import (
     help_keyboard,
     home_keyboard,
     main_menu_keyboard,
+    mystatus_keyboard,
     open_private_keyboard,
 )
 from bot.utils.timeparse import format_dt, humanize_delta
@@ -70,7 +72,9 @@ HELP_TOPICS: dict[str, str] = {
         "• <b>Kick / Ban mode</b> — kicked users can rejoin, banned cannot.\n\n"
         "<b>Advanced</b>: DM members about expiry, welcome message, join-request handling, "
         "who receives prompts (owner or all admins), a <b>grace period</b> after expiry before "
-        "removal, and a <b>daily digest</b> DM listing members expiring within 3 days."
+        "removal, a <b>daily digest</b> DM listing members expiring within 3 days, and "
+        "<b>renewal requests</b> — members tap 🙏 under their reminder and you get a one-tap "
+        "prompt to extend or decline."
     ),
     "commands": (
         "<b>⌨️ Commands &amp; formats</b>\n\n"
@@ -81,7 +85,8 @@ HELP_TOPICS: dict[str, str] = {
         "<code>/invite 3m Gold</code> · <code>/expiring 3d</code> · <code>/search name</code>\n"
         "<code>/setwelcome text</code> · <code>/setlog here</code> · <code>/broadcast text</code>\n"
         "<code>/sync</code> · <code>/forcecheck</code> · <code>/permissions</code>\n"
-        "<code>/export [active|soon|past]</code> — CSV spreadsheet · <code>/setgrace 24h</code>\n\n"
+        "<code>/export [active|soon|past]</code> — CSV spreadsheet · <code>/setgrace 24h</code>\n"
+        "<code>/setrenewals off</code> — members: <code>/renew</code> or 🙏 under a reminder\n\n"
         "<b>Durations</b>: <code>30d</code> <code>2w</code> <code>1m</code> <code>1y</code> <code>1m 15d</code> <code>never</code>\n"
         "<b>Dates</b>: <code>2025-12-31</code> · <code>31/12/2025 18:30</code>\n\n"
         "<i>Tip: the bottom menu is always one tap away — use it to jump to any screen.</i>"
@@ -155,8 +160,25 @@ async def cmd_help(message: Message, bot: Bot) -> None:
 
 
 async def mystatus_text(db: Database, settings: Settings, user_id: int, only_chat: int | None = None) -> str:
+    text, _ = await mystatus_screen(db, settings, user_id, only_chat)
+    return text
+
+
+async def mystatus_screen(
+    db: Database,
+    settings: Settings,
+    user_id: int,
+    only_chat: int | None = None,
+    service: MembershipService | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """The member's own view: every active membership plus a 🙏 button per renewable chat.
+
+    Pass ``service`` to filter the buttons by the chat's renewal setting / cooldowns;
+    without it every time-limited membership gets a button (the tap re-validates).
+    """
     now = datetime.now(timezone.utc)
     lines: list[str] = []
+    renewable: list[tuple[int, str]] = []
     for member in await db.memberships_for_user(user_id):
         if only_chat is not None and member.chat_id != only_chat:
             continue
@@ -167,15 +189,49 @@ async def mystatus_text(db: Database, settings: Settings, user_id: int, only_cha
         lines.append(
             f"• <b>{escape(chat.display)}</b>\n   ⏳ {format_dt(member.expires_at, settings.tz)} · {rem}"
         )
+        if member.expires_at is None:
+            continue
+        if service is None:
+            if chat.renewals_enabled:
+                renewable.append((chat.chat_id, chat.display))
+        elif await service.renewal_blocker(chat, member) is None:
+            renewable.append((chat.chat_id, chat.display))
     if not lines:
-        return "📇 You have no tracked memberships."
-    return "📇 <b>Your memberships</b>\n\n" + "\n".join(lines)
+        return "📇 You have no tracked memberships.", mystatus_keyboard()
+    text = "📇 <b>Your memberships</b>\n\n" + "\n".join(lines)
+    if renewable:
+        text += "\n\n<i>Need more time? Tap 🙏 and the admins get a one-tap prompt.</i>"
+    return text, mystatus_keyboard(renewable)
 
 
 @router.message(Command("mystatus", "me"))
-async def cmd_mystatus(message: Message, db: Database, settings: Settings) -> None:
-    only = None if message.chat.type == ChatType.PRIVATE else message.chat.id
-    await message.reply(await mystatus_text(db, settings, message.from_user.id, only))
+async def cmd_mystatus(message: Message, db: Database, settings: Settings, service: MembershipService) -> None:
+    if message.chat.type != ChatType.PRIVATE:
+        await message.reply(await mystatus_text(db, settings, message.from_user.id, message.chat.id))
+        return
+    text, kb = await mystatus_screen(db, settings, message.from_user.id, service=service)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.message(Command("renew", "requestrenewal"))
+async def cmd_renew(message: Message, bot: Bot, db: Database, settings: Settings, service: MembershipService) -> None:
+    """Member-side: ask the admins for more time (in a group: for that chat; in DM: pick a chat)."""
+    user_id = message.from_user.id
+    if message.chat.type != ChatType.PRIVATE:
+        chat = await db.get_chat(message.chat.id)
+        member = await db.get_member(message.chat.id, user_id) if chat else None
+        if not chat or not member:
+            await message.reply("You are not a tracked member here.")
+            return
+        ok, note = await service.request_renewal(chat, member)
+        me = await bot.me()
+        await message.reply(
+            note if ok else f"⚠️ {note}",
+            reply_markup=open_private_keyboard(me.username or "") if ok else None,
+        )
+        return
+    text, kb = await mystatus_screen(db, settings, user_id, service=service)
+    await message.answer(text, reply_markup=kb)
 
 
 @router.message(Command("id"))

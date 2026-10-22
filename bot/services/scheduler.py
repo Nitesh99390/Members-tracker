@@ -18,6 +18,7 @@ from bot.config import Settings
 from bot.services.database import Chat, Database, Member
 from bot.services.membership import MembershipService
 from bot.services.metrics import Metrics
+from bot.utils.keyboards import renewal_request_keyboard
 from bot.utils.permissions import refresh_chat_admins
 from bot.utils.timeparse import format_dt, humanize_delta
 
@@ -257,14 +258,20 @@ class ExpiryScheduler:
             target = min(crossed)
             if target in member.reminders_sent:
                 return
+            renewable = self.service.renewals_enabled(chat)
+            hint = (
+                "Tap 🙏 below to ask the admins for more time."
+                if renewable
+                else "Contact an admin to renew."
+            )
             async with sem:
                 sent = await self.service.dm_user(
                     member.user_id,
                     f"⏰ <b>Membership reminder</b>\n\n"
                     f"Your access to <b>{escape(chat.display)}</b> expires in "
                     f"<b>{humanize_delta(remaining)}</b> "
-                    f"({format_dt(member.expires_at, self.settings.tz)}).\n"
-                    f"Contact an admin to renew.",
+                    f"({format_dt(member.expires_at, self.settings.tz)}).\n{hint}",
+                    reply_markup=renewal_request_keyboard(chat.chat_id) if renewable else None,
                 )
             # mark this and all larger thresholds as sent so each stage fires once
             await self.db.mark_reminder_sent(

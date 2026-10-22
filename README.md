@@ -35,6 +35,7 @@ Built with Python 3.11+, [aiogram 3](https://docs.aiogram.dev/), SQLite and APSc
 | **CSV export** | *Tools → 📥 Export CSV* (or `/export [active\|soon\|lifetime\|past]`) sends an Excel/Sheets-friendly spreadsheet: ID, name, username, status, join & expiry dates, remaining time, source, renewals, notes. |
 | **Grace period** | Optional per-chat delay (`off · 12h · 1d · 3d` or `/setgrace 36h`) between expiry and removal, so late payers get a buffer. |
 | **Daily digest** | Opt-in per chat: one DM per day (at `DIGEST_HOUR` local time) to the owner/admins listing members expiring within 3 days. |
+| **Renewal requests** | Members tap 🙏 *Request renewal* under a reminder / expiry DM, in `/mystatus`, or send `/renew`. Admins get the usual one-tap prompt (`✅ Extend · default`, quick picks, `⋯ More`, `🚫 Decline`); durations add to the current expiry, declines keep it. One request per chat per 24 h; unanswered requests close after `ASK_TIMEOUT_HOURS`. Toggle per chat in *Advanced* or with `/setrenewals off`. |
 | **Maintenance** | Daily log pruning + SQLite backup (optionally sent to a chat), `/backup` and `/health` for super-admins, rotating log files. |
 | **Protection** | Per-user anti-spam throttling for commands/buttons; unhandled errors are DM'd to super-admins. |
 | **Robust** | Rate-limit aware, retries failed removals with backoff, permission checks, admin-cache refresh, WAL SQLite, schema auto-migration. |
@@ -156,9 +157,11 @@ The bot is designed so that an owner almost never types a command:
 | **Tools** | `➕ Add member` `🔍 Search` · `📣 Broadcast` (with preview + confirm + progress bar) `🛡 VIP list` · `🔄 Sync` `🔁 Run expiry check` · `📥 Export CSV` `🔐 Check permissions` |
 | **Export CSV** | `📥 Everyone · n` · `🟢 Active · n` `⏰ Expiring · n` · `♾ Lifetime · n` `📁 Past · n` — one tap sends the spreadsheet file |
 | **Settings** | Duration (current preset marked `✓`, `✏️ Custom`) · Tracking · Auto-remove · Ask on join · Kick/Ban · `🔧 Advanced` |
-| **Advanced** | Member DMs · Welcome on/off · Join requests (ignore / auto / ask) · Prompts → owner/admins · `⏱ Grace · off/12h/1d/3d` `✅ Daily digest` · `✏️ Welcome text` `📨 Log channel` editors |
-| **Pending** | One row per waiting member (`🙋` request / `👤` join) · `✅ Default for all (n)` bulk action with confirmation |
+| **Advanced** | Member DMs · Welcome on/off · Join requests (ignore / auto / ask) · Prompts → owner/admins · `⏱ Grace · off/12h/1d/3d` `✅ Daily digest` · `✅ Renewal requests` · `✏️ Welcome text` `📨 Log channel` editors |
+| **Pending** | One row per waiting member (`🙋` request / `👤` join / `🙏` renewal) · `✅ Default for all (n)` bulk action with confirmation |
 | **Join prompt** (DM) | `✅ Keep · 1 month` · three quick picks · `⋯ More options` / `🚫 Remove` |
+| **Renewal prompt** (DM) | `✅ Extend · 1 month` · `+1 week` `+3 months` `♾ Lifetime` · `⋯ More options` / `🚫 Decline` |
+| **My memberships** (members) | One line per chat with remaining time · `🙏 Request renewal · <chat>` per renewable chat · `🔄 Refresh` |
 | **Member card** | `+1 week` `+1 month` `+3 months` · `♾ Lifetime` `✏️ Custom` `⋯ More` · `◀️ Members` (same tab/page) |
 | **Activity** | Paged audit log (`◀️ Newer` / `Older ▶️`) |
 | **Help** | Short topic pages instead of a command wall |
@@ -188,6 +191,7 @@ All commands still work; they are simply not advertised in the menu.
 | `/permissions` · `/forcecheck` · `/sync` | Diagnostics |
 | `/export [all\|active\|soon\|lifetime\|past]` (`/csv`) | Send the member list as a CSV file |
 | `/setgrace <24\|12h\|3d\|off>` (`/grace`) | Grace period between expiry and removal (max 30 days) |
+| `/setrenewals <on\|off>` (`/renewals`) | Let members ask for a renewal with 🙏 / `/renew` |
 | `/setduration <30d\|1m\|never\|global>` | Default duration for this chat |
 | `/setlog <chat_id\|here\|off>` · `/setwelcome <text>` | Log destination / welcome template |
 
@@ -208,7 +212,7 @@ All commands still work; they are simply not advertised in the menu.
 | `/invite <3m\|1y\|never> [label]` | Link with a preset membership length |
 | `/invites` · `/revoke <link>` | List / revoke |
 
-### Super-admins: `/gstats` · `/backup` · `/health` &nbsp;&nbsp; Users: `/mystatus` · `/id` · `/help`
+### Super-admins: `/gstats` · `/backup` · `/health` &nbsp;&nbsp; Users: `/mystatus` · `/renew` · `/id` · `/help`
 
 ---
 
@@ -221,7 +225,7 @@ bot/
   middlewares.py             # DI, metrics, throttling, callback ack/de-dup, error reporting
   web.py                     # aiohttp side-car: /healthz /readyz /metrics + webhook receiver
   handlers/
-    common.py                # /start /help /mystatus /id
+    common.py                # /start /help /mystatus /renew /id
     menu.py                  # persistent bottom-menu (reply keyboard) taps
     admin.py                 # admin commands
     callbacks.py             # inline button handlers + guided text inputs (FSM)
@@ -240,7 +244,7 @@ bot/
     permissions.py           # admin checks
     cache.py                 # TTL + LRU cache for hot read paths
     telegram.py              # tg_call / tg_try: retries for flood limits & network blips
-tests/                       # pytest suite (113 tests)
+tests/                       # pytest suite (130 tests)
 ```
 
 Run tests: `python -m pytest -q`
