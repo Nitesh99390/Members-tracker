@@ -342,7 +342,7 @@ async def cmd_add(
 
 
 # ---------------------------------------------------------- /extend /setexpiry
-@router.message(Command("extend", "renew"))
+@router.message(Command("extend"))  # NB: /renew is the member-side request command (common.cmd_renew)
 async def cmd_extend(
     message: Message,
     command: CommandObject,
@@ -917,6 +917,37 @@ async def cmd_setgrace(
         f"⏱ Expired members are now removed after a grace period of <b>{grace_label(hours)}</b>."
         if hours
         else "⏱ Grace period off — expired members are removed right away."
+    )
+
+
+@router.message(Command("setrenewals", "renewals"))
+async def cmd_setrenewals(
+    message: Message, command: CommandObject, bot: Bot, db: Database, settings: Settings
+) -> None:
+    """``/setrenewals <on|off>`` — let members tap 🙏 to ask admins for more time."""
+    chat = await resolve_chat(message, bot, db, settings)
+    if not chat:
+        return
+    raw = (command.args or "").strip().lower()
+    if not raw:
+        await message.reply(
+            f"🙏 Renewal requests: <b>{'on' if chat.renewals_enabled else 'off'}</b>\n"
+            "Usage: <code>/setrenewals on</code> · <code>/setrenewals off</code>"
+        )
+        return
+    if raw in ("on", "yes", "1", "enable", "enabled"):
+        enabled = 1
+    elif raw in ("off", "no", "0", "disable", "disabled"):
+        enabled = 0
+    else:
+        await message.reply("⚠️ Say <code>on</code> or <code>off</code>.")
+        return
+    await db.update_chat(chat.chat_id, renewals_enabled=enabled)
+    await db.add_log(chat.chat_id, None, "toggle_renewals", str(enabled), message.from_user.id)
+    await message.reply(
+        "🙏 Members can now request renewals — you'll get a one-tap prompt for each."
+        if enabled
+        else "🙏 Renewal requests are off for this chat."
     )
 
 

@@ -327,6 +327,7 @@ def advanced_keyboard(chat: Chat) -> InlineKeyboardMarkup:
         _btn(f"⏱ Grace · {grace_label(chat.grace_hours)}", f"set:{cid}:grace"),
         _btn(f"{onoff(chat.digest_enabled)} Daily digest", f"set:{cid}:digest"),
     )
+    kb.row(_btn(f"{onoff(chat.renewals_enabled)} Renewal requests", f"set:{cid}:renewals"))
     kb.row(_btn("✏️ Welcome text", f"edit:{cid}:welcome"), _btn("📨 Log channel", f"edit:{cid}:log"))
     kb.row(_btn("◀️ Settings", f"settings:{cid}"), _home())
     return kb.as_markup()
@@ -370,6 +371,20 @@ def join_prompt_keyboard(
     return kb.as_markup()
 
 
+def renewal_prompt_keyboard(pending_id: int, default_value: str = "1m") -> InlineKeyboardMarkup:
+    """Admin prompt for a member's renewal request: extend by default / quick picks, more, decline."""
+    kb = InlineKeyboardBuilder()
+    kb.row(_btn(f"✅ Extend · {preset_label(default_value)}", f"jd:{pending_id}:default"))
+    kb.row(
+        *[
+            _btn(preset_label(v) if v == "never" else f"+{preset_label(v)}", f"jd:{pending_id}:{v}")
+            for v in quick_durations(default_value)
+        ]
+    )
+    kb.row(_btn("⋯ More options", f"jm:{pending_id}"), _btn("🚫 Decline", f"jr:{pending_id}"))
+    return kb.as_markup()
+
+
 def join_more_keyboard(pending_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for label, value in DURATION_PRESETS:
@@ -380,12 +395,10 @@ def join_more_keyboard(pending_id: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def join_remove_confirm_keyboard(pending_id: int, is_request: bool = False) -> InlineKeyboardMarkup:
+def join_remove_confirm_keyboard(pending_id: int, is_request: bool = False, is_renewal: bool = False) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.row(
-        _btn("✅ Yes, reject" if is_request else "✅ Yes, remove", f"jd:{pending_id}:remove"),
-        _btn("◀️ Back", f"jb:{pending_id}"),
-    )
+    label = "✅ Yes, decline" if is_renewal else ("✅ Yes, reject" if is_request else "✅ Yes, remove")
+    kb.row(_btn(label, f"jd:{pending_id}:remove"), _btn("◀️ Back", f"jb:{pending_id}"))
     return kb.as_markup()
 
 
@@ -522,7 +535,7 @@ def pending_keyboard(chat_id: int, items: list[PendingJoin]) -> InlineKeyboardMa
     """One tappable row per waiting member plus a bulk 'keep default for all'."""
     kb = InlineKeyboardBuilder()
     for p in items[:10]:
-        icon = "🙋" if p.source == "request" else "👤"
+        icon = {"request": "🙋", "renewal": "🙏"}.get(p.source, "👤")
         kb.row(_btn(f"{icon} {clip(p.full_name or str(p.user_id), BTN_NAME + 6)}", f"jb:{p.id}"))
     if len(items) > 1:
         kb.row(_btn(f"✅ Default for all ({len(items)})", f"pall:{chat_id}"))
@@ -594,7 +607,17 @@ def vips_keyboard(chat_id: int, members: list[Member], ids: list[int]) -> Inline
     return kb.as_markup()
 
 
-def mystatus_keyboard() -> InlineKeyboardMarkup:
+def mystatus_keyboard(renewable: list[tuple[int, str]] | None = None) -> InlineKeyboardMarkup:
+    """``renewable`` = (chat_id, chat title) pairs the user may ask a renewal for."""
     kb = InlineKeyboardBuilder()
+    for chat_id, title in (renewable or [])[:8]:
+        kb.row(_btn(f"🙏 Request renewal · {clip(title, BTN_NAME)}", f"rq:{chat_id}"))
     kb.row(_btn("🔄 Refresh", "mystatus"), _btn("🏠 Home", "home"))
+    return kb.as_markup()
+
+
+def renewal_request_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    """Single button under reminder / expiry DMs so a member can ask for more time."""
+    kb = InlineKeyboardBuilder()
+    kb.row(_btn("🙏 Request renewal", f"rq:{chat_id}"))
     return kb.as_markup()

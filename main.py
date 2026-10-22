@@ -65,6 +65,7 @@ GROUP_COMMANDS = [
     BotCommand(command="extend", description="Extend membership (reply)"),
     BotCommand(command="remove", description="Remove member (reply)"),
     BotCommand(command="mystatus", description="Your membership"),
+    BotCommand(command="renew", description="Ask the admins for more time"),
 ]
 
 SUPER_ADMIN_EXTRA = [

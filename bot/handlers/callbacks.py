@@ -9,7 +9,8 @@ tapping, typing is only needed for free-form values (custom dates, texts):
 ``member``   ``member:<cid>:<uid>[:<view>:<page>]`` member card
 ``ext``/``cust``/``more``/``hist``/``note``/``askm``/``wl``/``kick``/``untrack``
 ``set``/``dur``/``edit``/``editclr``/``editlog`` settings & editors
-``pending``/``pall``/``pallc``/``jd``/``jm``/``jr``/``jb``/``jc`` join prompts
+``pending``/``pall``/``pallc``/``jd``/``jm``/``jr``/``jb``/``jc`` join & renewal prompts
+``rq``       ``rq:<cid>`` member asks the admins for a renewal (from /mystatus or a reminder DM)
 ``invites``/``inpick``/``inew``/``incust``/``irev``/``irevc`` invite links
 ``addm``/``search``/``bcast``/``bcastc``/``vips``/``sync``/``fcheck``/``perms`` tools
 ``export``   ``export:<cid>`` scope picker · ``exportv:<cid>:<view>`` send the CSV
@@ -37,7 +38,7 @@ from aiogram.types import (
 
 from bot.config import Settings
 from bot.handlers import screens as S
-from bot.handlers.common import HELP_TOPICS, home_text, mystatus_text
+from bot.handlers.common import HELP_TOPICS, home_text, mystatus_screen
 from bot.services import export as X
 from bot.services.database import Chat, Database
 from bot.services.membership import MembershipService
@@ -222,9 +223,31 @@ async def cb_help(call: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "mystatus")
-async def cb_mystatus(call: CallbackQuery, db: Database, settings: Settings) -> None:
-    await _edit(call, await mystatus_text(db, settings, call.from_user.id), K.mystatus_keyboard())
+async def cb_mystatus(call: CallbackQuery, db: Database, settings: Settings, service: MembershipService) -> None:
+    text, kb = await mystatus_screen(db, settings, call.from_user.id, service=service)
+    await _edit(call, text, kb)
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("rq:"))
+async def cb_request_renewal(call: CallbackQuery, db: Database, settings: Settings, service: MembershipService) -> None:
+    """Member-side: ask the owner/admins for more time in one chat."""
+    chat_id = int(_ids(call.data, 1)[0])
+    chat = await db.get_chat(chat_id)
+    member = await db.get_member(chat_id, call.from_user.id) if chat else None
+    if not chat or not member:
+        await call.answer("You are not a tracked member of that chat.", show_alert=True)
+        return
+    ok, note = await service.request_renewal(chat, member)
+    if ok:
+        await call.answer("Request sent ✅")
+        if call.message and call.message.chat.type == ChatType.PRIVATE:
+            await call.message.answer(note)
+            # refresh the memberships screen so the button disappears while the request is open
+            text, kb = await mystatus_screen(db, settings, call.from_user.id, service=service)
+            await _edit(call, text, kb)
+        return
+    await call.answer(note, show_alert=True)
 
 
 @router.callback_query(F.data == "chats")
@@ -309,7 +332,7 @@ async def cb_toggle(
 
     updates: dict[str, object] = {}
     note = "Saved"
-    advanced = key in ("notify", "welcome", "approve", "asktarget", "grace", "digest")
+    advanced = key in ("notify", "welcome", "approve", "asktarget", "grace", "digest", "renewals")
     if key == "mode":
         updates["kick_mode"] = "ban" if chat.kick_mode == "kick" else "kick"
         note = "Expired members are banned" if updates["kick_mode"] == "ban" else "Expired members are kicked (can rejoin)"
@@ -346,6 +369,9 @@ async def cb_toggle(
     elif key == "digest":
         updates["digest_enabled"] = int(not chat.digest_enabled)
         note = "You'll get a daily expiring-soon digest" if updates["digest_enabled"] else "Daily digest off"
+    elif key == "renewals":
+        updates["renewals_enabled"] = int(not chat.renewals_enabled)
+        note = "Members can request renewals" if updates["renewals_enabled"] else "Renewal requests off"
     else:
         await call.answer("Unknown setting")
         return
@@ -734,10 +760,7 @@ async def cb_join_decision(
     if not pending:
         return
     await state.clear()
-    if pending.source == "request":
-        ok, outcome = await service.apply_request_decision(pending, value, call.from_user.id, call.from_user.full_name)
-    else:
-        ok, outcome = await service.apply_join_decision(pending, value, call.from_user.id, call.from_user.full_name)
+    ok, outcome = await service.apply_decision(pending, value, call.from_user.id, call.from_user.full_name)
     if not ok and "Already" in outcome:
         await call.answer(outcome, show_alert=True)
         return
@@ -768,12 +791,17 @@ async def cb_join_remove_confirm(call: CallbackQuery, bot: Bot, db: Database, se
         await call.answer("Already handled.", show_alert=True)
         return
     is_req = pending.source == "request"
-    verb = "Reject" if is_req else "Remove"
-    await _edit(
-        call,
-        f"⚠️ <b>{verb} {pending.mention_html}</b> (<code>{pending.user_id}</code>) from {escape(chat.display)}?",
-        K.join_remove_confirm_keyboard(pid, is_req),
-    )
+    is_renewal = pending.source == "renewal"
+    if is_renewal:
+        text = (
+            f"⚠️ <b>Decline the renewal request from {pending.mention_html}</b> "
+            f"(<code>{pending.user_id}</code>) in {escape(chat.display)}?\n"
+            f"<i>They keep their current expiry.</i>"
+        )
+    else:
+        verb = "Reject" if is_req else "Remove"
+        text = f"⚠️ <b>{verb} {pending.mention_html}</b> (<code>{pending.user_id}</code>) from {escape(chat.display)}?"
+    await _edit(call, text, K.join_remove_confirm_keyboard(pid, is_req, is_renewal))
     await call.answer()
 
 
@@ -791,11 +819,7 @@ async def cb_join_back(
         await call.answer(f"Already handled ({pending.decision or pending.status}).", show_alert=True)
         return
     member = await db.get_member(chat.chat_id, pending.user_id)
-    await _edit(
-        call,
-        service.join_prompt_text(chat, pending, member),
-        K.join_prompt_keyboard(pid, service.effective_duration(chat), pending.source == "request"),
-    )
+    await _edit(call, service.prompt_text(chat, pending, member), service.prompt_keyboard(chat, pending))
     if call.message:
         await db.add_prompt_message(pid, call.from_user.id, call.message.message_id)
     await call.answer()
@@ -849,7 +873,7 @@ async def cb_pending_all_confirm(call: CallbackQuery, bot: Bot, db: Database, se
         call,
         f"✅ <b>Apply the default to everyone waiting?</b>\n\n"
         f"<b>{count}</b> member{'s' if count != 1 else ''} in {escape(chat.display)} will get "
-        f"<b>{escape(label)}</b>. Join requests are approved.",
+        f"<b>{escape(label)}</b>. Join requests are approved; renewal requests are extended by it.",
         K.pending_all_confirm_keyboard(chat_id, count),
     )
     await call.answer()
@@ -864,10 +888,7 @@ async def cb_pending_all(call: CallbackQuery, bot: Bot, db: Database, settings: 
     items = await db.list_pending(chat_id, limit=200)
     done = 0
     for p in items:
-        if p.source == "request":
-            ok, _ = await service.apply_request_decision(p, "default", call.from_user.id, call.from_user.full_name)
-        else:
-            ok, _ = await service.apply_join_decision(p, "default", call.from_user.id, call.from_user.full_name)
+        ok, _ = await service.apply_decision(p, "default", call.from_user.id, call.from_user.full_name)
         done += int(ok)
     await db.add_log(chat_id, None, "pending_bulk_default", f"{done}/{len(items)}", call.from_user.id)
     await _show(call, await S.pending_screen(db, chat, settings))
@@ -1222,10 +1243,7 @@ async def on_join_custom_text(
         await message.reply(f"⚠️ {escape(str(exc))}\nTry again ({INPUT_HINT}) or /cancel.")
         return
     await state.clear()
-    if pending.source == "request":
-        ok, outcome = await service.apply_request_decision(pending, value, message.from_user.id, message.from_user.full_name)
-    else:
-        ok, outcome = await service.apply_join_decision(pending, value, message.from_user.id, message.from_user.full_name)
+    ok, outcome = await service.apply_decision(pending, value, message.from_user.id, message.from_user.full_name)
     await message.answer(outcome if ok else f"❌ {outcome}")
 
 

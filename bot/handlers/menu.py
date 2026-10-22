@@ -27,8 +27,9 @@ from aiogram.types import Message
 
 from bot.config import Settings
 from bot.handlers import screens as S
-from bot.handlers.common import HELP_TOPICS, _is_admin_user, home_text, mystatus_text
+from bot.handlers.common import HELP_TOPICS, _is_admin_user, home_text, mystatus_screen
 from bot.services.database import Chat, Database
+from bot.services.membership import MembershipService
 from bot.utils import keyboards as K
 from bot.utils.permissions import is_admin
 
@@ -160,9 +161,12 @@ async def menu_help(message: Message, state: FSMContext) -> None:
 
 
 @router.message(*_tap(K.MENU_STATUS))
-async def menu_status(message: Message, db: Database, settings: Settings, state: FSMContext) -> None:
+async def menu_status(
+    message: Message, db: Database, settings: Settings, service: MembershipService, state: FSMContext
+) -> None:
     await state.clear()
-    await message.answer(await mystatus_text(db, settings, message.from_user.id), reply_markup=K.mystatus_keyboard())
+    text, kb = await mystatus_screen(db, settings, message.from_user.id, service=service)
+    await message.answer(text, reply_markup=kb)
 
 
 @router.message(*_tap(K.MENU_ADD))

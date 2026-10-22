@@ -23,7 +23,7 @@ from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboa
 
 from bot.config import Settings
 from bot.services.database import Chat, Database, Member, PendingJoin
-from bot.utils.keyboards import join_prompt_keyboard
+from bot.utils.keyboards import join_prompt_keyboard, renewal_prompt_keyboard, renewal_request_keyboard
 from bot.utils.telegram import TelegramUnavailable, error_text, tg_call, tg_try
 from bot.utils.timeparse import (
     ParseError,
@@ -46,6 +46,8 @@ class MembershipService:
     # Telegram allows ~30 msg/s overall; keep a comfortable margin for DMs so a
     # broadcast or a burst of reminders never starves interactive replies.
     SEND_CONCURRENCY = 8
+    #: A member may send one renewal request per chat within this window (after a decision).
+    RENEWAL_COOLDOWN = timedelta(hours=24)
 
     def __init__(self, bot: Bot, db: Database, settings: Settings) -> None:
         self.bot = bot
@@ -268,6 +270,27 @@ class MembershipService:
                 await self.db.add_prompt_message(pending_id, admin_id, msg.message_id)
         return delivered
 
+    def prompt_keyboard(self, chat: Chat, pending: PendingJoin) -> InlineKeyboardMarkup:
+        """The right inline keyboard for any kind of pending prompt."""
+        if pending.source == "renewal":
+            return renewal_prompt_keyboard(pending.id, self.effective_duration(chat))
+        return join_prompt_keyboard(pending.id, self.effective_duration(chat), pending.source == "request")
+
+    def prompt_text(self, chat: Chat, pending: PendingJoin, member: Member | None) -> str:
+        if pending.source == "renewal":
+            return self.renewal_prompt_text(chat, pending, member)
+        return self.join_prompt_text(chat, pending, member)
+
+    async def apply_decision(
+        self, pending: PendingJoin, decision: str, actor_id: int, actor_name: str = ""
+    ) -> tuple[bool, str]:
+        """Dispatch an admin decision to the flow matching ``pending.source``."""
+        if pending.source == "renewal":
+            return await self.apply_renewal_decision(pending, decision, actor_id, actor_name)
+        if pending.source == "request":
+            return await self.apply_request_decision(pending, decision, actor_id, actor_name)
+        return await self.apply_join_decision(pending, decision, actor_id, actor_name)
+
     def join_prompt_text(self, chat: Chat, pending: PendingJoin, member: Member | None) -> str:
         icon = "📢" if chat.is_channel else "👥"
         default_label = describe_duration(self.effective_duration(chat))
@@ -458,13 +481,175 @@ class MembershipService:
             )
         return True, outcome
 
+    # ---------------------------------------------------------- renewal flow
+    def renewals_enabled(self, chat: Chat) -> bool:
+        return chat.tracking_enabled and chat.renewals_enabled
+
+    async def renewal_blocker(self, chat: Chat, member: Member) -> str | None:
+        """Why ``member`` cannot ask for a renewal right now (``None`` = they can)."""
+        if not self.renewals_enabled(chat):
+            return "Renewal requests are disabled for this chat. Please contact an admin directly."
+        if member.status not in ("active", "expired"):
+            # left voluntarily / removed by an admin: not a renewal, they need a fresh invite
+            return "You are no longer a member of this chat. Please contact an admin directly."
+        if member.expires_at is None and member.status == "active":
+            return "You already have lifetime access."
+        if await self.db.get_pending_for(chat.chat_id, member.user_id):
+            return "Your request is already waiting for an admin — you'll be notified once it's decided."
+        last = await self.db.last_pending(chat.chat_id, member.user_id, "renewal")
+        if last and last.status in ("decided", "expired", "cancelled") and last.decided_at:
+            left = last.decided_at + self.RENEWAL_COOLDOWN - datetime.now(timezone.utc)
+            if left > timedelta(0):
+                return f"You can send another renewal request in {humanize_delta(left)}."
+        return None
+
+    async def request_renewal(self, chat: Chat, member: Member) -> tuple[bool, str]:
+        """A member asks the owner/admins to extend their membership.
+
+        Returns ``(ok, message for the member)``.
+        """
+        blocker = await self.renewal_blocker(chat, member)
+        if blocker:
+            return False, blocker
+        recipients = await self.prompt_recipients(chat)
+        if not recipients:
+            return False, "No admin can be reached right now. Please contact an admin directly."
+        pending = await self.db.create_pending(
+            chat.chat_id, member.user_id, member.full_name, member.username, source="renewal"
+        )
+        text = self.renewal_prompt_text(chat, pending, member)
+        delivered = await self.deliver_prompt(pending.id, recipients, text, self.prompt_keyboard(chat, pending))
+        if not delivered:
+            await self.db.resolve_pending(pending.id, None, "undeliverable", status="cancelled")
+            await self.db.add_log(chat.chat_id, member.user_id, "renewal_undeliverable", None)
+            return False, "No admin can be reached right now. Please contact an admin directly."
+        await self.db.add_log(chat.chat_id, member.user_id, "renewal_requested", f"to {delivered} admin(s)")
+        await self.send_log(
+            chat,
+            f"🙏 <b>Renewal requested</b> {member.mention_html} [<code>{member.user_id}</code>]\n"
+            f"📍 {escape(chat.display)}\n⏳ Current expiry: <b>{format_dt(member.expires_at, self.settings.tz)}</b>",
+        )
+        return True, (
+            f"🙏 Your renewal request for <b>{escape(chat.display)}</b> was sent to the admins.\n"
+            f"You'll get a message here as soon as they decide."
+        )
+
+    def renewal_prompt_text(self, chat: Chat, pending: PendingJoin, member: Member | None) -> str:
+        icon = "📢" if chat.is_channel else "👥"
+        uname = f" · @{escape(pending.username)}" if pending.username else ""
+        now = datetime.now(timezone.utc)
+        if member is None:
+            state = "—"
+        elif member.status != "active":
+            state = f"<b>{escape(member.status)}</b> (no longer in the chat)"
+        elif member.expires_at is None:
+            state = "<b>lifetime</b>"
+        elif member.expires_at <= now:
+            state = f"<b>expired {humanize_delta(now - member.expires_at)} ago</b>"
+        else:
+            state = (
+                f"<b>{humanize_delta(member.expires_at - now)}</b> left "
+                f"(until {format_dt(member.expires_at, self.settings.tz)})"
+            )
+        renewals = f"\n🔁 Renewed before: <b>{member.renewals}</b>×" if member and member.renewals else ""
+        note = f"\n📝 {escape(member.note)}" if member and member.note else ""
+        return (
+            f"🙏 <b>Renewal request</b>\n\n"
+            f"👤 {pending.mention_html}{uname}\n"
+            f"🆔 <code>{pending.user_id}</code>\n"
+            f"{icon} {escape(chat.display)}\n"
+            f"⏳ Membership: {state}{renewals}{note}\n\n"
+            f"Extend by how much? <i>Durations add to the current expiry; "
+            f"unanswered requests close after {self.settings.ask_timeout_hours}h.</i>"
+        )
+
+    async def apply_renewal_decision(
+        self, pending: PendingJoin, decision: str, actor_id: int, actor_name: str = ""
+    ) -> tuple[bool, str]:
+        """Apply an admin's answer to a renewal request.
+
+        ``decision`` is a duration / date / ``never`` to extend, ``default`` for the
+        chat's default duration, or ``remove`` to decline (the member keeps their
+        current expiry). Returns ``(ok, human message)``.
+        """
+        chat = await self.db.get_chat(pending.chat_id)
+        if not chat:
+            await self.db.resolve_pending(pending.id, actor_id, "chat_missing", status="cancelled")
+            return False, "Chat no longer tracked."
+        member = await self.db.get_member(chat.chat_id, pending.user_id)
+        if member is None:
+            await self.db.resolve_pending(pending.id, actor_id, "member_missing", status="cancelled")
+            return False, "Member is no longer tracked."
+
+        value = self.effective_duration(chat) if decision == "default" else decision
+        if decision != "remove":
+            # validate before claiming so the admin can retry on typos
+            try:
+                self.expiry_from_text(value)
+            except ParseError as exc:
+                return False, f"Invalid duration/date: {exc}"
+
+        if not await self.db.resolve_pending(pending.id, actor_id, decision):
+            return False, "Already handled by another admin."
+
+        was_removed = member.status != "active"
+        if decision == "remove":
+            await self.db.add_log(chat.chat_id, member.user_id, "renewal_declined", None, actor_id)
+            outcome = "🚫 Renewal declined — " + ("member stays removed." if was_removed else "current expiry kept.")
+            await self._finalize_prompt(pending, chat, member, outcome, actor_name)
+            if chat.notify_user:
+                tail = (
+                    ""
+                    if was_removed
+                    else (
+                        f" Your membership is still valid until "
+                        f"<b>{format_dt(member.expires_at, self.settings.tz)}</b>."
+                    )
+                )
+                await self.dm_user(
+                    member.user_id,
+                    f"ℹ️ Your renewal request for <b>{escape(chat.display)}</b> was declined.{tail}",
+                )
+            return True, outcome
+
+        try:
+            new_expiry = await self.extend_member(chat, member, value, actor_id)
+        except ParseError as exc:
+            await self.db._exec(
+                "UPDATE pending_joins SET status='pending', decided_at=NULL, decided_by=NULL, decision=NULL WHERE id=?",
+                (pending.id,),
+            )
+            return False, f"Invalid duration/date: {exc}"
+        await self.db.add_log(chat.chat_id, member.user_id, "renewal_approved", decision, actor_id)
+        label = "Lifetime" if is_permanent(value) else describe_duration(value)
+        if new_expiry is not None and label == value:
+            label = format_dt(new_expiry, self.settings.tz)
+        outcome = f"✅ Renewed <b>{escape(label)}</b> — until <b>{format_dt(new_expiry, self.settings.tz)}</b>"
+        rejoin_note = ""
+        if was_removed:
+            # they were already kicked/banned: lift the ban so they can come back, and tell the admin
+            unbanned = await tg_try(
+                self.bot.unban_chat_member, chat.chat_id, member.user_id, only_if_banned=True, label="unban"
+            )
+            outcome += "\n↩️ Member was removed earlier — " + (
+                "ban lifted, they can rejoin now." if unbanned is not None else "send them a fresh invite link."
+            )
+            rejoin_note = (
+                " You were removed earlier, so please rejoin "
+                + ("the chat." if unbanned is not None else "using an invite link from an admin.")
+            )
+        await self._finalize_prompt(pending, chat, member, outcome, actor_name)
+        await self.notify_extension(chat, member.user_id, new_expiry, extra=rejoin_note)
+        return True, outcome
+
     async def _finalize_prompt(
         self, pending: PendingJoin, chat: Chat, member: Member, outcome: str, actor_name: str
     ) -> None:
         """Edit every admin's prompt message to show the decision and drop the buttons."""
         uname = f" (@{escape(pending.username)})" if pending.username else ""
+        title = "🙏 <b>Renewal request</b>" if pending.source == "renewal" else "🔔 <b>Member decision</b>"
         text = (
-            f"🔔 <b>Member decision</b>\n\n"
+            f"{title}\n\n"
             f"👤 {pending.mention_html}{uname}\n🆔 <code>{pending.user_id}</code>\n"
             f"📍 <b>{escape(chat.display)}</b>\n\n{outcome}"
             + (f"\n👮 Decided by: {escape(actor_name)}" if actor_name else "")
@@ -499,14 +684,24 @@ class MembershipService:
             count += 1
             chat = await self.db.get_chat(pending.chat_id)
             member = await self.db.get_member(pending.chat_id, pending.user_id)
-            if chat and member:
-                await self._finalize_prompt(
-                    pending,
-                    chat,
-                    member,
-                    f"⏱ No answer — default kept (until <b>{format_dt(member.expires_at, self.settings.tz)}</b>).",
-                    "",
-                )
+            if not (chat and member):
+                continue
+            if pending.source == "renewal":
+                await self._finalize_prompt(pending, chat, member, "⏱ No answer — request closed, expiry unchanged.", "")
+                if chat.notify_user:
+                    await self.dm_user(
+                        member.user_id,
+                        f"⏱ Nobody answered your renewal request for <b>{escape(chat.display)}</b> yet. "
+                        f"You can ask again later or contact an admin directly.",
+                    )
+                continue
+            await self._finalize_prompt(
+                pending,
+                chat,
+                member,
+                f"⏱ No answer — default kept (until <b>{format_dt(member.expires_at, self.settings.tz)}</b>).",
+                "",
+            )
         return count
 
     # -------------------------------------------------------------- leave/kick
@@ -574,11 +769,18 @@ class MembershipService:
             f"📋 Reason: {escape(reason)}",
         )
         if chat.notify_user and reason == "expired":
+            # in kick mode the user may come back, so let them ask for a renewal right away
+            renewable = self.renewals_enabled(chat) and chat.kick_mode == "kick"
+            hint = (
+                "Tap 🙏 below to ask the admins to renew your membership."
+                if renewable
+                else "Contact an admin to renew your membership."
+            )
             await self.dm_user(
                 member.user_id,
                 f"⌛ <b>Membership expired</b>\n\n"
-                f"Your access to <b>{escape(chat.display)}</b> has ended and you have been removed.\n"
-                f"Contact an admin to renew your membership.",
+                f"Your access to <b>{escape(chat.display)}</b> has ended and you have been removed.\n{hint}",
+                reply_markup=renewal_request_keyboard(chat.chat_id) if renewable else None,
             )
         return True, "ok"
 
@@ -636,7 +838,9 @@ class MembershipService:
         )
         return new_expiry
 
-    async def notify_extension(self, chat: Chat, user_id: int, new_expiry: datetime | None) -> None:
+    async def notify_extension(
+        self, chat: Chat, user_id: int, new_expiry: datetime | None, extra: str = ""
+    ) -> None:
         if not chat.notify_user:
             return
         if new_expiry is None:
@@ -646,7 +850,7 @@ class MembershipService:
                 f"🎉 Your membership in <b>{escape(chat.display)}</b> has been extended until "
                 f"<b>{format_dt(new_expiry, self.settings.tz)}</b>."
             )
-        await self.dm_user(user_id, text)
+        await self.dm_user(user_id, text + extra)
 
     # ----------------------------------------------------------- invite links
     async def create_invite_link(
