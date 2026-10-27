@@ -13,10 +13,11 @@ from __future__ import annotations
 import csv
 import io
 import re
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from bot.services.database import Chat, Member
+from bot.services.database import Chat, Database, Member
 from bot.utils.timeparse import humanize_delta
 
 #: ``view key`` → human label. Order = order shown in captions / usage text.
@@ -90,6 +91,32 @@ def members_csv(members: list[Member], tz: ZoneInfo, now: datetime | None = None
     for m in members:
         writer.writerow(member_row(m, tz, now))
     return ("\ufeff" + buf.getvalue()).encode("utf-8")
+
+
+async def members_csv_stream(
+    members: AsyncIterator[Member], tz: ZoneInfo, now: datetime | None = None
+) -> tuple[bytes, int]:
+    """Like :func:`members_csv` but consumes an async iterator row by row.
+
+    Only the compact CSV text accumulates (~100 bytes/row); ``Member``
+    dataclasses are created and discarded one at a time, so exporting a chat
+    with 200k members costs a few MB instead of hundreds. Returns
+    ``(csv_bytes, row_count)``.
+    """
+    now = now or datetime.now(timezone.utc)
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")
+    writer.writerow(CSV_COLUMNS)
+    count = 0
+    async for m in members:
+        writer.writerow(member_row(m, tz, now))
+        count += 1
+    return ("\ufeff" + buf.getvalue()).encode("utf-8"), count
+
+
+async def export_chat_csv(db: Database, chat_id: int, view: str, tz: ZoneInfo) -> tuple[bytes, int]:
+    """Stream ``view`` members of ``chat_id`` from SQLite (100-row batches) straight into CSV."""
+    return await members_csv_stream(db.iter_members_for_export(chat_id, view), tz)
 
 
 def view_label(view: str) -> str:

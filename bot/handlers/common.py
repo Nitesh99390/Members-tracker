@@ -96,10 +96,11 @@ HELP_TOPICS: dict[str, str] = {
 
 async def _is_admin_user(db: Database, settings: Settings, user_id: int) -> tuple[bool, bool]:
     """Return (is_admin_anywhere, has_chats)."""
+    # index-only COUNT(*) — no Chat rows are materialised just to answer yes/no
     if user_id in settings.super_admins:
-        return True, bool(await db.list_chats())
-    chats = await db.chats_for_admin(user_id)
-    return bool(chats), bool(chats)
+        return True, await db.count_chats() > 0
+    has = await db.count_admin_chats(user_id) > 0
+    return has, has
 
 
 def home_text(first_name: str, is_admin: bool, has_chats: bool) -> str:

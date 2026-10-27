@@ -284,7 +284,8 @@ class ExpiryScheduler:
         return reminded
 
     async def refresh_admins(self) -> None:
-        for chat in await self.db.list_chats(only_tracking=True):
+        # streamed 100 rows at a time — thousands of chats never sit in one list
+        async for chat in self.db.iter_chats(only_tracking=True):
             await refresh_chat_admins(self.service.bot, self.db, chat.chat_id)
             await self.service.get_owner_id(chat, refresh=True)
             await asyncio.sleep(0.2)
@@ -318,7 +319,7 @@ class ExpiryScheduler:
         sent = 0
         now = datetime.now(timezone.utc)
         horizon = now + timedelta(days=DIGEST_DAYS)
-        for chat in await self.db.digest_chats():
+        async for chat in self.db.iter_digest_chats():
             try:
                 members = await self.db.expiring_members(horizon, chat.chat_id)
                 text = self.digest_text(chat, members, now)

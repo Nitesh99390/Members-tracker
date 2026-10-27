@@ -40,6 +40,7 @@ Built with Python 3.11+, [aiogram 3](https://docs.aiogram.dev/), SQLite and APSc
 | **Protection** | Per-user anti-spam throttling for commands/buttons; unhandled errors are DM'd to super-admins. |
 | **Robust** | Rate-limit aware, retries failed removals with backoff, permission checks, admin-cache refresh, WAL SQLite, schema auto-migration. |
 | **Fast** | In-memory TTL caches for chat settings / admin & whitelist checks, covering SQLite indexes, concurrent (bounded) removals, reminders, prompts and broadcasts, instant callback acks with double-tap de-duplication. |
+| **Flat memory** | RAM does not grow with your data. Lists are paged **in SQL** (`LIMIT/OFFSET` + index-only `COUNT(*)`), exports / broadcasts / sync stream members in 100-row batches, per-user anti-spam tables are LRU-bounded (500 entries), and SQLite's page cache is pinned to 4 MB with temp tables on disk. A 200k-member chat costs a few MB, not hundreds. |
 | **Ops-ready** | Long polling **or webhook** mode, optional HTTP side-car with `/healthz` · `/readyz` · `/metrics` (Prometheus), JSON logs, graceful SIGTERM shutdown, startup retries when Telegram is unreachable, Docker `HEALTHCHECK`. |
 
 ---
@@ -122,7 +123,24 @@ With `HTTP_PORT` set:
 | `GET /readyz` | Readiness – authenticated, polling/webhook active, scheduler not stale |
 | `GET /metrics` | Prometheus text format (`?format=json` for JSON): updates, errors, throttled taps, handler latency p95, removals, reminders, cache hit-rates, DB size… |
 
-`/health` in Telegram (super-admins) shows the same numbers inline.
+`/health` in Telegram (super-admins) shows the same numbers inline, plus the SQLite memory
+policy currently in force (page-cache cap, `temp_store`, `mmap`).
+
+### Memory footprint
+
+The bot is designed to run comfortably on the smallest VPS / free-tier container, however
+large the communities it manages. The rules every code path follows:
+
+| Concern | How it is bounded |
+|---------|-------------------|
+| Chat picker (`/chats`) | One page (6 chats) is fetched with `LIMIT 6 OFFSET ?`; the page count comes from an index-only `COUNT(*)`. Never loads the whole `chats` table, even for super-admins. |
+| "Has chats?" / "only one chat?" checks | `COUNT(*)` + `LIMIT 1` — no `Chat` rows are built just to answer yes/no. |
+| CSV export | Rows are streamed from a server-side cursor (`fetchmany(100)`) straight into the CSV writer; only the compact text accumulates (~100 bytes/row). |
+| Broadcast · `/sync` · bulk *apply default* | Keyset paging (`WHERE user_id > ? LIMIT 100` / `WHERE id > ?`) so only one 100-row batch of objects is alive while Telegram calls run. |
+| Scheduler sweeps (admin refresh, daily digest) | Chats are streamed 100 at a time instead of one giant list. |
+| Pending screen | `LIMIT 10` + `COUNT(*)` for the "…and N more" footer. |
+| Anti-spam / error-dedupe / callback-dedupe tables | `BoundedDict` — LRU with a hard cap of **500** keys, plus idle-entry sweeps on every scheduler tick. Inactive users are simply forgotten. |
+| SQLite | `cache_size=-4000` (4 MB page cache), `temp_store=FILE`, `mmap_size=0`, daily `PRAGMA shrink_memory`. Covering indexes on `(chat_id, status, expires_at)`, `(chat_id, joined_at)`, `(user_id, chat_id)` for admins and `(chat_id, status, id)` for pending joins mean hot counts never touch table rows. |
 
 ---
 
