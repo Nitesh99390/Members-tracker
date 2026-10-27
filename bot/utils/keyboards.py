@@ -155,8 +155,11 @@ def open_private_keyboard(bot_username: str, text: str = "💬 Open dashboard") 
 
 
 # ------------------------------------------------------------------ chat pick
-#: Chat buttons per page in the "Your chats" picker.
-CHATS_PAGE = 10
+#: Chat buttons per page in the "Your chats" picker (BotFather-style grid: 3 rows × 2 columns).
+CHATS_PAGE = 6
+CHATS_COLS = 2
+#: Max visible chars of a chat title inside a two-column button.
+CHATS_TITLE_LEN = 18
 
 
 def chats_total_pages(count: int) -> int:
@@ -177,30 +180,37 @@ def chats_keyboard(
     badges: dict[int, tuple[int, int]] | None = None,
     page: int = 0,
 ) -> InlineKeyboardMarkup:
-    """Paged chat picker: ``CHATS_PAGE`` rows, then ``⬅️ Back · n/N · Next ➡️``, then 🏠 Home.
+    """BotFather-style chat picker: a 2-column grid of ``CHATS_PAGE`` chats, then a ``«`` / ``»`` pager.
 
-    ``badges`` = {chat_id: (active_members, pending)} adds live counters.
-    Pager taps use ``chats:<page>`` and edit the same message in place.
+    Mirrors Telegram's ``/mybots`` screen — short labels in two columns and a single
+    wide ``»`` (or ``«``) button to flip pages. Both arrows share one row when both exist.
+    ``badges`` = {chat_id: (active_members, pending)}; only the pending counter is shown
+    (``🔔n``) to keep the two-column labels readable. Pager taps use ``chats:<page>`` and
+    edit the same message in place.
     """
     visible, page, total_pages = chats_page_slice(chats, page)
     kb = InlineKeyboardBuilder()
+    buttons = []
     for chat in visible:
         prefix = "▸ " if chat.chat_id == current else ""
         icon = "📢" if chat.is_channel else "👥"
-        state = "" if chat.tracking_enabled else " · ⏸"
         extra = ""
         if badges and chat.chat_id in badges:
-            active, pending = badges[chat.chat_id]
-            extra = f" · {active}"
+            _active, pending = badges[chat.chat_id]
             if pending:
-                extra += f" · 🔔{pending}"
-        kb.row(_btn(f"{prefix}{icon} {clip(chat.display, 30)}{state}{extra}", f"dash:{chat.chat_id}"))
+                extra = f" 🔔{pending}"
+        if not chat.tracking_enabled:
+            extra += " ⏸"
+        buttons.append(_btn(f"{prefix}{icon} {clip(chat.display, CHATS_TITLE_LEN)}{extra}", f"dash:{chat.chat_id}"))
+    for i in range(0, len(buttons), CHATS_COLS):
+        kb.row(*buttons[i : i + CHATS_COLS])
     if total_pages > 1:
-        kb.row(
-            _btn("⬅️ Back", f"chats:{page - 1}") if page > 0 else _btn("·", "noop"),
-            _btn(f"{page + 1}/{total_pages}", "noop"),
-            _btn("Next ➡️", f"chats:{page + 1}") if page < total_pages - 1 else _btn("·", "noop"),
-        )
+        pager = []
+        if page > 0:
+            pager.append(_btn("«", f"chats:{page - 1}"))
+        if page < total_pages - 1:
+            pager.append(_btn("»", f"chats:{page + 1}"))
+        kb.row(*pager)
     kb.row(_btn("🏠 Home", "home"))
     return kb.as_markup()
 
