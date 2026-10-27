@@ -47,14 +47,7 @@ def _icon(chat: Chat) -> str:
 
 
 # ------------------------------------------------------------------- chats
-async def chats_screen(db: Database, chats: list[Chat], current: int | None, page: int = 0) -> Screen:
-    """BotFather-style chat picker (``K.CHATS_PAGE`` per page, 2 columns) with pending badges.
-
-    Only one cheap query per visible chat (pending count) so page flips feel instant.
-    """
-    visible, page, total_pages = K.chats_page_slice(chats, page)
-    pendings = await asyncio.gather(*(db.count_pending(c.chat_id) for c in visible))
-    badges: dict[int, tuple[int, int]] = {c.chat_id: (0, p) for c, p in zip(visible, pendings)}
+def _chats_page_text(visible: list[Chat], pendings: list[int], page: int, total_pages: int) -> str:
     total_pending = sum(pendings)
     title = "Choose a chat from the list below:"
     if total_pages > 1:
@@ -63,7 +56,35 @@ async def chats_screen(db: Database, chats: list[Chat], current: int | None, pag
     if total_pending:
         lines.append("")
         lines.append(f"🔔 <b>{total_pending}</b> member{'s' if total_pending != 1 else ''} waiting for a decision.")
-    return "\n".join(lines), K.chats_keyboard(chats, current, badges, page)
+    return "\n".join(lines)
+
+
+async def chats_screen(db: Database, chats: list[Chat], current: int | None, page: int = 0) -> Screen:
+    """BotFather-style chat picker rendered from an *already loaded* list.
+
+    Kept for callers that hold a small, bounded list (tests, single-chat
+    fallbacks). Interactive handlers use :func:`chats_screen_for` which pages
+    in SQL and never loads more than one page of chats.
+    """
+    visible, page, total_pages = K.chats_page_slice(chats, page)
+    pendings = list(await asyncio.gather(*(db.count_pending(c.chat_id) for c in visible)))
+    badges: dict[int, tuple[int, int]] = {c.chat_id: (0, p) for c, p in zip(visible, pendings)}
+    text = _chats_page_text(visible, pendings, page, total_pages)
+    return text, K.chats_keyboard(visible, current, badges, page, total_pages=total_pages)
+
+
+async def chats_screen_for(db: Database, user_id: int | None, current: int | None, page: int = 0) -> Screen:
+    """Chat picker for ``user_id`` (``None`` = super-admin) with SQL-level paging.
+
+    ``LIMIT 6 OFFSET ?`` + ``COUNT(*)`` in SQLite: exactly one page of ``Chat``
+    objects plus one pending-count per visible chat ever touch Python memory,
+    whether the admin manages 2 chats or 20 000.
+    """
+    visible, page, total_pages = await db.admin_chats_page(user_id, page, K.CHATS_PAGE)
+    pendings = list(await asyncio.gather(*(db.count_pending(c.chat_id) for c in visible)))
+    badges: dict[int, tuple[int, int]] = {c.chat_id: (0, p) for c, p in zip(visible, pendings)}
+    text = _chats_page_text(visible, pendings, page, total_pages)
+    return text, K.chats_keyboard(visible, current, badges, page, total_pages=total_pages)
 
 
 # --------------------------------------------------------------- dashboard
@@ -332,19 +353,24 @@ async def logs_screen(db: Database, chat: Chat, settings: Settings, page: int = 
 
 
 # ----------------------------------------------------------------- pending
+PENDING_PAGE = 10
+
+
 async def pending_screen(db: Database, chat: Chat, settings: Settings) -> Screen:
-    items = await db.list_pending(chat.chat_id, limit=20)
-    lines = [f"🔔 <b>Pending — {escape(chat.display)}</b> · {len(items)}", ""]
+    """First ``PENDING_PAGE`` pending joins (``LIMIT 10``) + an index-only ``COUNT(*)`` for the rest."""
+    total = await db.count_pending(chat.chat_id)
+    items = await db.list_pending(chat.chat_id, limit=PENDING_PAGE) if total else []
+    lines = [f"🔔 <b>Pending — {escape(chat.display)}</b> · {total}", ""]
     if not items:
         lines.append("<i>Nothing waiting. New joins will appear here until you answer their prompt.</i>")
     else:
         now = datetime.now(settings.tz)
-        for p in items[:10]:
+        for p in items:
             age = humanize_delta(now - p.created_at.astimezone(settings.tz))
             kind = {"request": "requested to join", "renewal": "asked for a renewal"}.get(p.source, "joined")
             lines.append(f"• {p.mention_html} · <code>{p.user_id}</code> · {kind} {age} ago")
-        if len(items) > 10:
-            lines.append(f"<i>…and {len(items) - 10} more</i>")
+        if total > len(items):
+            lines.append(f"<i>…and {total - len(items)} more</i>")
         lines.append("")
         lines.append("<i>Tap a name to decide, or apply the default to everyone at once.</i>")
     return "\n".join(lines), K.pending_keyboard(chat.chat_id, items)

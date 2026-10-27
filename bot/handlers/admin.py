@@ -70,16 +70,18 @@ async def resolve_chat(
     # private chat → use context; fall back to the only chat the admin has
     chat_id = await db.get_context(user.id)
     if chat_id is None:
-        chats = await db.list_chats() if user.id in settings.super_admins else await db.chats_for_admin(user.id)
-        if len(chats) == 1:
-            chat_id = chats[0].chat_id
+        # COUNT(*) + LIMIT 1 instead of loading every chat the admin manages
+        picker = _picker_user(settings, user.id)
+        only = await db.first_admin_chat(picker) if await db.count_admin_chats(picker) == 1 else None
+        if only:
+            chat_id = only.chat_id
             await db.set_context(user.id, chat_id)
     if chat_id is None:
-        await message.answer("Pick a chat first.", reply_markup=_chats_markup_or_none(await _admin_chats(db, settings, user.id), None))
+        await message.answer("Pick a chat first.", reply_markup=await _chats_markup_or_none(db, settings, user.id))
         return None
     chat = await db.get_chat(chat_id)
     if chat is None:
-        await message.answer("⚠️ That chat is no longer tracked.", reply_markup=_chats_markup_or_none(await _admin_chats(db, settings, user.id), None))
+        await message.answer("⚠️ That chat is no longer tracked.", reply_markup=await _chats_markup_or_none(db, settings, user.id))
         return None
     if not await is_admin(bot, db, settings, chat.chat_id, user.id):
         await message.answer("⛔ You are not an admin of the selected chat.")
@@ -87,14 +89,15 @@ async def resolve_chat(
     return chat
 
 
-async def _admin_chats(db: Database, settings: Settings, user_id: int) -> list[Chat]:
-    if user_id in settings.super_admins:
-        return await db.list_chats()
-    return await db.chats_for_admin(user_id)
+def _picker_user(settings: Settings, user_id: int) -> int | None:
+    """``None`` for super-admins (they see every chat), else the admin's id."""
+    return None if user_id in settings.super_admins else user_id
 
 
-def _chats_markup_or_none(chats: list[Chat], current: int | None):
-    return chats_keyboard(chats, current) if chats else None
+async def _chats_markup_or_none(db: Database, settings: Settings, user_id: int, current: int | None = None):
+    """First picker page straight from SQL (``LIMIT 6``) — never the whole chats table."""
+    visible, page, total_pages = await db.admin_chats_page(_picker_user(settings, user_id), 0)
+    return chats_keyboard(visible, current, page=page, total_pages=total_pages) if visible else None
 
 
 async def resolve_target(
@@ -143,8 +146,9 @@ def _usage(message: Message, text: str):
 @router.message(Command("chats", "panel", "settings", "menu", "dashboard"), F.chat.type == ChatType.PRIVATE)
 async def cmd_chats(message: Message, bot: Bot, db: Database, settings: Settings) -> None:
     user_id = message.from_user.id
-    chats = await _admin_chats(db, settings, user_id)
-    if not chats:
+    picker = _picker_user(settings, user_id)
+    n_chats = await db.count_admin_chats(picker)  # index-only COUNT(*), no rows loaded
+    if not n_chats:
         me = await bot.me()
         from bot.utils.keyboards import home_keyboard  # local import avoids a cycle
 
@@ -156,19 +160,21 @@ async def cmd_chats(message: Message, bot: Bot, db: Database, settings: Settings
         return
     current = await db.get_context(user_id)
     cmd = (message.text or "").split()[0].lstrip("/").lower().split("@")[0]
-    if len(chats) == 1 and current is None:
-        current = chats[0].chat_id
-        await db.set_context(user_id, current)
+    if n_chats == 1 and current is None:
+        only = await db.first_admin_chat(picker)
+        if only:
+            current = only.chat_id
+            await db.set_context(user_id, current)
     if current and cmd in ("panel", "settings", "menu", "dashboard"):
         chat = await db.get_chat(current)
         if chat:
             if cmd == "settings":
                 text, markup = S.settings_screen(chat, settings)
             else:
-                text, markup = await S.dashboard_screen(db, chat, settings, len(chats) > 1)
+                text, markup = await S.dashboard_screen(db, chat, settings, n_chats > 1)
             await message.answer(text, reply_markup=markup)
             return
-    text, markup = await S.chats_screen(db, chats, current)
+    text, markup = await S.chats_screen_for(db, picker, current)
     await message.answer(text, reply_markup=markup)
 
 
@@ -876,16 +882,16 @@ async def cmd_export(
     if view not in dict(X.EXPORT_VIEWS):
         await _usage(message, "/export [all | active | soon | lifetime | past]")
         return
-    members = await db.members_for_export(chat.chat_id, view)
-    if not members:
+    if not await db.count_members_view(chat.chat_id, view):  # index-only COUNT(*)
         await message.reply("Nothing to export for that selection.")
         return
-    data = X.members_csv(members, settings.tz)
+    # rows are streamed from SQLite in 100-row batches straight into the CSV writer
+    data, count = await X.export_chat_csv(db, chat.chat_id, view, settings.tz)
     await message.reply_document(
         BufferedInputFile(data, filename=X.export_filename(chat, view)),
-        caption=escape(X.export_caption(chat, view, len(members))),
+        caption=escape(X.export_caption(chat, view, count)),
     )
-    await db.add_log(chat.chat_id, None, "export", f"{view} {len(members)} rows", message.from_user.id)
+    await db.add_log(chat.chat_id, None, "export", f"{view} {count} rows", message.from_user.id)
 
 
 @router.message(Command("setgrace", "grace"))
@@ -992,9 +998,13 @@ async def cmd_health(
     ok = await db.healthcheck()
     last = await db.kv_get("last_check")
     last_txt = format_dt(datetime.fromisoformat(last), settings.tz) if last else "never"
+    mem = await db.memory_stats()
+    cache_kb = abs(int(mem.get("cache_size") or 0))  # negative => KiB
+    temp_store = {0: "default", 1: "file", 2: "memory"}.get(mem.get("temp_store"), str(mem.get("temp_store")))
     lines = [
         f"🩺 <b>Health</b> · <code>{VERSION_TAG}</code> ({__version__})",
         f"Database: {'✅' if ok else '❌'} · {db.db_size_bytes() / 1024:.0f} KB",
+        f"SQLite RAM cap: page cache <b>{cache_kb / 1024:.0f} MB</b> · temp_store {temp_store} · mmap {mem.get('mmap_size', 0)}",
         f"Scheduler: {'✅ running' if scheduler.running else '❌ stopped'} · every {settings.check_interval}s",
         f"Last expiry check: {last_txt} ({scheduler.last_run_duration * 1000:.0f} ms)",
         f"Mode: {'webhook' if settings.webhook_url else 'polling'}"

@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -51,10 +51,18 @@ CREATE TABLE IF NOT EXISTS members (
     PRIMARY KEY (chat_id, user_id),
     FOREIGN KEY (chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE
 );
+-- Covering indexes: every COUNT(*) / paged list on the hot paths is answered
+-- from the index b-tree alone ("USING COVERING INDEX" in EXPLAIN QUERY PLAN),
+-- so no table row is ever pulled into RAM just to be counted.
+--   * (chat_id, user_id)          -> PRIMARY KEY autoindex (sqlite_autoindex_members_1)
+--   * (chat_id, status[, expires_at]) -> idx_members_chat_status
 CREATE INDEX IF NOT EXISTS idx_members_expiry ON members(status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_members_chat_status ON members(chat_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_members_chat_joined ON members(chat_id, joined_at);
 CREATE INDEX IF NOT EXISTS idx_members_user ON members(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_members_username ON members(chat_id, username COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_chats_created ON chats(created_at);
+CREATE INDEX IF NOT EXISTS idx_chats_added_by ON chats(added_by);
 
 CREATE TABLE IF NOT EXISTS whitelist (
     chat_id  INTEGER NOT NULL,
@@ -69,6 +77,7 @@ CREATE TABLE IF NOT EXISTS chat_admins (
     user_id  INTEGER NOT NULL,
     PRIMARY KEY (chat_id, user_id)
 );
+CREATE INDEX IF NOT EXISTS idx_chat_admins_user ON chat_admins(user_id, chat_id);
 
 CREATE TABLE IF NOT EXISTS logs (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,7 +114,7 @@ CREATE TABLE IF NOT EXISTS pending_joins (
     UNIQUE (chat_id, user_id, status) ON CONFLICT REPLACE
 );
 CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_joins(status, created_at);
-CREATE INDEX IF NOT EXISTS idx_pending_chat ON pending_joins(chat_id, status);
+CREATE INDEX IF NOT EXISTS idx_pending_chat ON pending_joins(chat_id, status, id);
 
 -- Messages sent to admins for a pending join (so we can edit them all once decided)
 CREATE TABLE IF NOT EXISTS prompt_messages (
@@ -148,6 +157,32 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("members", "source", "TEXT"),  # join | request | invite:<link> | manual
     ("members", "renewals", "INTEGER NOT NULL DEFAULT 0"),
 ]
+
+# Indexes created *after* the first release on columns that are themselves
+# added by MIGRATIONS (so they cannot live in SCHEMA).
+MIGRATION_INDEXES: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_chats_owner ON chats(owner_id)",
+)
+
+# Connection-level memory policy. SQLite is the only component that could
+# grow with the data set, so it is pinned hard:
+#   cache_size = -4000  -> page cache capped at 4 MB (negative = KiB)
+#   temp_store = FILE   -> sorts / temp b-trees spill to disk, not RAM
+#   mmap_size  = 0      -> no memory-mapped I/O (keeps RSS flat & predictable)
+PRAGMAS: tuple[str, ...] = (
+    "PRAGMA journal_mode = WAL",
+    "PRAGMA synchronous = NORMAL",
+    "PRAGMA cache_size = -4000",
+    "PRAGMA temp_store = FILE",
+    "PRAGMA mmap_size = 0",
+    "PRAGMA foreign_keys = ON",
+    "PRAGMA busy_timeout = 30000",
+)
+
+#: Rows pulled from SQLite per round-trip when streaming a large result set.
+STREAM_BATCH = 100
+#: Chats per page in the private-chat picker (mirrors ``keyboards.CHATS_PAGE``).
+CHATS_PAGE = 6
 
 
 _MISSING = object()
@@ -396,17 +431,27 @@ class Database:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(self.path, timeout=30)
         self._conn.row_factory = aiosqlite.Row
-        await self._conn.execute("PRAGMA journal_mode=WAL")
-        await self._conn.execute("PRAGMA foreign_keys=ON")
-        await self._conn.execute("PRAGMA synchronous=NORMAL")
-        await self._conn.execute("PRAGMA busy_timeout=30000")
-        await self._conn.execute("PRAGMA temp_store=MEMORY")
-        await self._conn.execute("PRAGMA cache_size=-16000")  # ~16 MB page cache
-        await self._conn.execute("PRAGMA mmap_size=134217728")  # 128 MB, ignored if unsupported
+        for pragma in PRAGMAS:
+            await self._conn.execute(pragma)
         await self._conn.executescript(SCHEMA)
         await self._migrate()
         await self._conn.commit()
-        log.info("Database ready at %s", self.path)
+        log.info("Database ready at %s (page cache 4 MB, temp_store=FILE, mmap off)", self.path)
+
+    async def pragma(self, name: str) -> Any:
+        """Read back a PRAGMA value (used by /health and tests)."""
+        row = await self._fetchone(f"PRAGMA {name}")
+        return row[0] if row else None
+
+    async def memory_stats(self) -> dict[str, Any]:
+        """SQLite-side memory figures for the health screen."""
+        out: dict[str, Any] = {}
+        for key in ("cache_size", "temp_store", "mmap_size", "journal_mode", "page_size"):
+            try:
+                out[key] = await self.pragma(key)
+            except Exception:  # noqa: BLE001
+                out[key] = None
+        return out
 
     # ---------------------------------------------------------------- cache
     def cache_stats(self) -> dict[str, Any]:
@@ -441,7 +486,28 @@ class Database:
             if column not in existing:
                 log.info("Migrating: adding %s.%s", table, column)
                 await self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        for stmt in MIGRATION_INDEXES:
+            await self.conn.execute(stmt)
         await self.conn.commit()
+
+    async def index_columns(self, table: str) -> dict[str, list[str]]:
+        """``{index_name: [columns...]}`` for ``table`` (includes PK autoindexes)."""
+        out: dict[str, list[str]] = {}
+        async with self.conn.execute(f"PRAGMA index_list({table})") as cur:
+            names = [r["name"] for r in await cur.fetchall()]
+        for name in names:
+            async with self.conn.execute(f"PRAGMA index_info({name})") as cur:
+                out[name] = [r["name"] for r in await cur.fetchall()]
+        return out
+
+    async def has_index_prefix(self, table: str, columns: Iterable[str]) -> bool:
+        """True if some index on ``table`` starts with exactly ``columns`` (covers that lookup)."""
+        want = list(columns)
+        return any(cols[: len(want)] == want for cols in (await self.index_columns(table)).values())
+
+    async def query_plan(self, sql: str, params: Iterable[Any] = ()) -> str:
+        rows = await self._fetchall(f"EXPLAIN QUERY PLAN {sql}", params)
+        return "\n".join(str(r["detail"]) for r in rows)
 
     async def close(self) -> None:
         if self._conn:
@@ -475,12 +541,37 @@ class Database:
         async with self.conn.execute(sql, tuple(params)) as cur:
             return list(await cur.fetchall())
 
+    async def _count(self, sql: str, params: Iterable[Any] = ()) -> int:
+        row = await self._fetchone(sql, params)
+        return int(row[0]) if row else 0
+
+    async def _stream(
+        self, sql: str, params: Iterable[Any] = (), batch: int = STREAM_BATCH
+    ) -> AsyncIterator[aiosqlite.Row]:
+        """Yield rows one at a time, fetching ``batch`` rows per round-trip.
+
+        Only ``batch`` rows are ever materialised in Python, no matter how big
+        the result set is. The cursor stays open for the duration, so callers
+        must not hold it across long awaits on huge tables (use keyset paging
+        helpers such as :meth:`iter_members` for that).
+        """
+        self.queries += 1
+        async with self.conn.execute(sql, tuple(params)) as cur:
+            cur.arraysize = batch
+            while True:
+                rows = await cur.fetchmany(batch)
+                if not rows:
+                    return
+                for row in rows:
+                    yield row
+
     async def optimize(self) -> None:
         """Run SQLite's self-tuning + WAL checkpoint; cheap, safe to call daily."""
         async with self._write_lock:
             try:
                 await self.conn.execute("PRAGMA optimize")
                 await self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                await self.conn.execute("PRAGMA shrink_memory")  # hand freed pages back to the OS
                 await self.conn.commit()
             except Exception as exc:  # noqa: BLE001 - never fatal
                 log.debug("optimize failed: %s", exc)
@@ -539,18 +630,80 @@ class Database:
         return chat
 
     async def digest_chats(self) -> list[Chat]:
-        """Tracked chats whose admins want the daily expiring digest."""
+        """Tracked chats whose admins want the daily expiring digest (bounded page)."""
         rows = await self._fetchall(
-            "SELECT * FROM chats WHERE tracking_enabled=1 AND digest_enabled=1 ORDER BY created_at"
+            "SELECT * FROM chats WHERE tracking_enabled=1 AND digest_enabled=1 ORDER BY created_at LIMIT 500"
         )
         return [Chat.from_row(r) for r in rows]
 
-    async def list_chats(self, only_tracking: bool = False) -> list[Chat]:
+    async def iter_digest_chats(self) -> AsyncIterator[Chat]:
+        async for row in self._stream(
+            "SELECT * FROM chats WHERE tracking_enabled=1 AND digest_enabled=1 ORDER BY chat_id"
+        ):
+            yield Chat.from_row(row)
+
+    async def list_chats(self, only_tracking: bool = False, limit: int = 500, offset: int = 0) -> list[Chat]:
+        """Chats page (bounded). Prefer :meth:`iter_chats` for whole-table passes."""
         sql = "SELECT * FROM chats"
         if only_tracking:
             sql += " WHERE tracking_enabled=1"
-        rows = await self._fetchall(sql + " ORDER BY created_at")
+        rows = await self._fetchall(sql + " ORDER BY created_at LIMIT ? OFFSET ?", (limit, offset))
         return [Chat.from_row(r) for r in rows]
+
+    async def iter_chats(self, only_tracking: bool = False) -> AsyncIterator[Chat]:
+        """Stream every chat in ``STREAM_BATCH`` sized fetches (scheduler sweeps)."""
+        sql = "SELECT * FROM chats"
+        if only_tracking:
+            sql += " WHERE tracking_enabled=1"
+        async for row in self._stream(sql + " ORDER BY chat_id"):
+            yield Chat.from_row(row)
+
+    async def count_chats(self, only_tracking: bool = False) -> int:
+        sql = "SELECT COUNT(*) FROM chats"
+        if only_tracking:
+            sql += " WHERE tracking_enabled=1"
+        return await self._count(sql)
+
+    # -- chat picker (SQL-level paging; never loads the whole chats table) --
+    _ADMIN_CHATS_WHERE = (
+        "(c.added_by=? OR c.owner_id=? OR c.chat_id IN (SELECT chat_id FROM chat_admins WHERE user_id=?))"
+    )
+
+    def _picker_where(self, user_id: int | None) -> tuple[str, list[Any]]:
+        if user_id is None:  # super-admin: everything
+            return "1=1", []
+        return self._ADMIN_CHATS_WHERE, [user_id, user_id, user_id]
+
+    async def count_admin_chats(self, user_id: int | None) -> int:
+        """How many chats ``user_id`` may manage (``None`` = super-admin → all)."""
+        where, args = self._picker_where(user_id)
+        return await self._count(f"SELECT COUNT(*) FROM chats c WHERE {where}", args)
+
+    async def admin_chats_page(
+        self, user_id: int | None, page: int = 0, per_page: int = CHATS_PAGE
+    ) -> tuple[list[Chat], int, int]:
+        """``(visible_chats, clamped_page, total_pages)`` straight from SQL.
+
+        ``LIMIT ? OFFSET ?`` + ``COUNT(*)`` mean at most ``per_page`` ``Chat``
+        objects exist in RAM, whether the admin has 3 chats or 30 000.
+        """
+        where, args = self._picker_where(user_id)
+        total = await self._count(f"SELECT COUNT(*) FROM chats c WHERE {where}", args)
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        page = min(max(0, page), total_pages - 1)
+        rows = await self._fetchall(
+            f"SELECT c.* FROM chats c WHERE {where} ORDER BY c.created_at LIMIT ? OFFSET ?",
+            [*args, per_page, page * per_page],
+        )
+        return [Chat.from_row(r) for r in rows], page, total_pages
+
+    async def first_admin_chat(self, user_id: int | None) -> Chat | None:
+        """The single chat an admin manages (``LIMIT 1``; used when they have exactly one)."""
+        where, args = self._picker_where(user_id)
+        row = await self._fetchone(
+            f"SELECT c.* FROM chats c WHERE {where} ORDER BY c.created_at LIMIT 1", args
+        )
+        return Chat.from_row(row) if row else None
 
     async def update_chat(self, chat_id: int, **fields: Any) -> None:
         if not fields:
@@ -750,21 +903,67 @@ class Database:
             out[view] = int(row[0]) if row else 0
         return out
 
-    async def iter_all_members(self, chat_id: int) -> list[Member]:
-        rows = await self._fetchall(
-            "SELECT * FROM members WHERE chat_id=? ORDER BY joined_at", (chat_id,)
-        )
-        return [Member.from_row(r) for r in rows]
+    async def iter_members(
+        self, chat_id: int, status: str | None = "active", batch: int = STREAM_BATCH
+    ) -> AsyncIterator[Member]:
+        """Stream a chat's members with keyset paging — ``batch`` rows in RAM at a time.
 
-    async def members_for_export(self, chat_id: int, view: str = "all", limit: int = 50000) -> list[Member]:
-        """Every member matching a named view, ordered for a human-readable export."""
+        Walks the ``(chat_id, user_id)`` primary-key index with
+        ``WHERE user_id > ? ... LIMIT ?``; no open cursor is held between
+        batches, so callers may await Telegram calls freely while iterating.
+        """
+        last_uid: int | None = None
+        while True:
+            sql = "SELECT * FROM members WHERE chat_id=?"
+            params: list[Any] = [chat_id]
+            if status:
+                sql += " AND status=?"
+                params.append(status)
+            if last_uid is not None:
+                sql += " AND user_id>?"
+                params.append(last_uid)
+            sql += " ORDER BY user_id LIMIT ?"
+            params.append(batch)
+            rows = await self._fetchall(sql, params)
+            if not rows:
+                return
+            for row in rows:
+                yield Member.from_row(row)
+            last_uid = int(rows[-1]["user_id"])
+            if len(rows) < batch:
+                return
+
+    async def count_members_view(self, chat_id: int, view: str = "all") -> int:
+        """Index-only ``COUNT(*)`` for an export / list scope."""
         frag, params = self._filter_sql(view if view in self.MEMBER_FILTERS else "all", None)
-        rows = await self._fetchall(
+        return await self._count(f"SELECT COUNT(*) FROM members WHERE chat_id=? AND {frag}", [chat_id, *params])
+
+    async def iter_members_for_export(
+        self, chat_id: int, view: str = "all", batch: int = STREAM_BATCH
+    ) -> AsyncIterator[Member]:
+        """Stream every member matching a named view in human-readable order.
+
+        Uses a server-side cursor (``fetchmany(batch)``); the export writer
+        consumes rows as they arrive, so a 200k-member chat never exists as a
+        Python list.
+        """
+        frag, params = self._filter_sql(view if view in self.MEMBER_FILTERS else "all", None)
+        async for row in self._stream(
             f"""SELECT * FROM members WHERE chat_id=? AND {frag}
-                ORDER BY status='active' DESC, expires_at IS NULL, expires_at ASC, joined_at ASC LIMIT ?""",
-            [chat_id, *params, limit],
-        )
-        return [Member.from_row(r) for r in rows]
+                ORDER BY status='active' DESC, expires_at IS NULL, expires_at ASC, joined_at ASC""",
+            [chat_id, *params],
+            batch=batch,
+        ):
+            yield Member.from_row(row)
+
+    async def members_for_export(self, chat_id: int, view: str = "all", limit: int = 1000) -> list[Member]:
+        """Small bounded convenience wrapper around :meth:`iter_members_for_export` (tests, previews)."""
+        out: list[Member] = []
+        async for m in self.iter_members_for_export(chat_id, view):
+            out.append(m)
+            if len(out) >= limit:
+                break
+        return out
 
     async def count_members(self, chat_id: int, status: str | None = "active") -> int:
         sql = "SELECT COUNT(*) FROM members WHERE chat_id=?"
@@ -772,8 +971,7 @@ class Database:
         if status:
             sql += " AND status=?"
             params.append(status)
-        row = await self._fetchone(sql, params)
-        return int(row[0]) if row else 0
+        return await self._count(sql, params)
 
     async def expired_members(self, now: datetime | None = None, limit: int = 200) -> list[Member]:
         now = now or utcnow()
@@ -1003,22 +1201,45 @@ class Database:
         )
         return PendingJoin.from_row(row) if row else None
 
-    async def list_pending(self, chat_id: int | None = None, limit: int = 50) -> list[PendingJoin]:
+    async def list_pending(
+        self, chat_id: int | None = None, limit: int = 50, after_id: int | None = None
+    ) -> list[PendingJoin]:
+        """Oldest-first pending page. ``after_id`` enables keyset batching (see :meth:`iter_pending`)."""
         sql = "SELECT * FROM pending_joins WHERE status='pending'"
         params: list[Any] = []
         if chat_id is not None:
             sql += " AND chat_id=?"
             params.append(chat_id)
-        sql += " ORDER BY created_at ASC LIMIT ?"
+        if after_id is not None:
+            sql += " AND id>?"
+            params.append(after_id)
+        sql += " ORDER BY id ASC LIMIT ?"
         params.append(limit)
         rows = await self._fetchall(sql, params)
         return [PendingJoin.from_row(r) for r in rows]
 
+    async def iter_pending(self, chat_id: int, batch: int = STREAM_BATCH) -> AsyncIterator[PendingJoin]:
+        """Stream pending joins ``batch`` at a time (bulk approve/decline).
+
+        Keyset paging on ``id`` means rows resolved (or left pending because a
+        decision failed) while iterating are never re-fetched, so the loop
+        always terminates.
+        """
+        after: int | None = None
+        while True:
+            items = await self.list_pending(chat_id, limit=batch, after_id=after)
+            if not items:
+                return
+            for p in items:
+                yield p
+            after = items[-1].id
+            if len(items) < batch:
+                return
+
     async def count_pending(self, chat_id: int) -> int:
-        row = await self._fetchone(
+        return await self._count(
             "SELECT COUNT(*) FROM pending_joins WHERE chat_id=? AND status='pending'", (chat_id,)
         )
-        return int(row[0]) if row else 0
 
     async def resolve_pending(
         self, pending_id: int, decided_by: int | None, decision: str, status: str = "decided"

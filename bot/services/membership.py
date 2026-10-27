@@ -22,7 +22,7 @@ from aiogram.exceptions import (
 from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, User
 
 from bot.config import Settings
-from bot.services.database import Chat, Database, Member, PendingJoin
+from bot.services.database import STREAM_BATCH, Chat, Database, Member, PendingJoin
 from bot.utils.keyboards import join_prompt_keyboard, renewal_prompt_keyboard, renewal_request_keyboard
 from bot.utils.telegram import TelegramUnavailable, error_text, tg_call, tg_try
 from bot.utils.timeparse import (
@@ -35,6 +35,9 @@ from bot.utils.timeparse import (
     parse_date,
     parse_expiry,
 )
+
+#: Members processed per batch in sync / broadcast (also the DB fetch size).
+BULK_BATCH = STREAM_BATCH
 
 log = logging.getLogger(__name__)
 
@@ -946,7 +949,6 @@ class MembershipService:
     async def sync_chat_members(self, chat: Chat) -> dict[str, int]:
         """Cross-check tracked members with Telegram (cheap consistency pass)."""
         result = {"checked": 0, "gone": 0, "errors": 0}
-        members = await self.db.list_members(chat.chat_id, "active", limit=5000)
         sem = asyncio.Semaphore(6)
 
         async def check(member: Member) -> None:
@@ -975,16 +977,27 @@ class MembershipService:
                         chat.chat_id, member.user_id, cm.user.full_name, cm.user.username
                     )
 
-        await asyncio.gather(*(check(m) for m in members))
+        # keyset-paged stream: only one 100-row batch of Member objects is alive at a time
+        batch: list[Member] = []
+        async for m in self.db.iter_members(chat.chat_id, "active", batch=BULK_BATCH):
+            batch.append(m)
+            if len(batch) >= BULK_BATCH:
+                await asyncio.gather(*(check(x) for x in batch))
+                batch.clear()
+        if batch:
+            await asyncio.gather(*(check(x) for x in batch))
         await self.db.add_log(chat.chat_id, None, "sync", str(result))
         return result
 
     async def broadcast(
         self, chat: Chat, text: str, actor_id: int, progress=None
     ) -> tuple[int, int]:
-        """DM every active member concurrently (bounded). Returns (sent, total)."""
-        members = await self.db.list_members(chat.chat_id, "active", limit=10000)
-        total = len(members)
+        """DM every active member, 100 at a time (bounded). Returns (sent, total).
+
+        ``total`` comes from an index-only ``COUNT(*)``; members are then
+        streamed with keyset paging so a 100k-member chat never sits in RAM.
+        """
+        total = await self.db.count_members(chat.chat_id, "active")
         sent = 0
         done = 0
         body = f"📣 <b>{escape(chat.display)}</b>\n\n{text}"
@@ -997,6 +1010,13 @@ class MembershipService:
             if progress and done % 50 == 0:
                 await progress(done, total)
 
-        await asyncio.gather(*(one(m) for m in members))
+        batch: list[Member] = []
+        async for m in self.db.iter_members(chat.chat_id, "active", batch=BULK_BATCH):
+            batch.append(m)
+            if len(batch) >= BULK_BATCH:
+                await asyncio.gather(*(one(x) for x in batch))
+                batch.clear()
+        if batch:
+            await asyncio.gather(*(one(x) for x in batch))
         await self.db.add_log(chat.chat_id, None, "broadcast", f"{sent}/{total}", actor_id)
         return sent, total

@@ -179,6 +179,7 @@ def chats_keyboard(
     current: int | None,
     badges: dict[int, tuple[int, int]] | None = None,
     page: int = 0,
+    total_pages: int | None = None,
 ) -> InlineKeyboardMarkup:
     """BotFather-style chat picker: a 2-column grid of ``CHATS_PAGE`` chats, then a ``«`` / ``»`` pager.
 
@@ -187,8 +188,19 @@ def chats_keyboard(
     ``badges`` = {chat_id: (active_members, pending)}; only the pending counter is shown
     (``🔔n``) to keep the two-column labels readable. Pager taps use ``chats:<page>`` and
     edit the same message in place.
+
+    Two calling styles:
+
+    * ``chats`` is the *full* list → it is sliced here (``total_pages`` omitted);
+    * ``chats`` is *one page* already fetched with ``LIMIT/OFFSET`` in SQL and
+      ``total_pages`` comes from ``COUNT(*)`` → nothing else is loaded.
     """
-    visible, page, total_pages = chats_page_slice(chats, page)
+    if total_pages is None:
+        visible, page, total_pages = chats_page_slice(chats, page)
+    else:
+        visible = chats[:CHATS_PAGE]
+        total_pages = max(1, total_pages)
+        page = min(max(0, page), total_pages - 1)
     kb = InlineKeyboardBuilder()
     buttons = []
     for chat in visible:

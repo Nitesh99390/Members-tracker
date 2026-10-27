@@ -14,9 +14,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from typing import Any
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Hashable
 
 from aiogram import BaseMiddleware
 from aiogram.exceptions import TelegramBadRequest
@@ -67,6 +67,47 @@ def _update_kind(event: TelegramObject) -> str:
     return type(event).__name__.lower()
 
 
+#: Hard ceiling for every per-user / per-key dictionary kept by middlewares.
+#: With lakhs of distinct users only the 500 most recently *seen* keys stay
+#: resident; everyone else is simply treated as a fresh visitor.
+BOUNDED_MAX = 500
+
+
+class BoundedDict(OrderedDict):
+    """LRU-bounded ``dict``: inserting beyond ``maxsize`` evicts the oldest key.
+
+    Reads via :meth:`touch` / ``__setitem__`` move a key to the "young" end so
+    active users are never evicted in favour of one-off visitors.
+    """
+
+    def __init__(self, maxsize: int = BOUNDED_MAX) -> None:
+        super().__init__()
+        self.maxsize = max(1, int(maxsize))
+        self.evictions = 0
+
+    def __setitem__(self, key: Hashable, value: Any) -> None:
+        super().__setitem__(key, value)
+        self.move_to_end(key)
+        while len(self) > self.maxsize:
+            self.popitem(last=False)
+            self.evictions += 1
+
+    def touch(self, key: Hashable, default: Any = None) -> Any:
+        """``get`` that also refreshes LRU position (``default`` is *not* stored)."""
+        if key in self:
+            self.move_to_end(key)
+            return super().__getitem__(key)
+        return default
+
+    def expire(self, max_age: float, now: float | None = None) -> int:
+        """Drop entries whose value (a monotonic timestamp) is older than ``max_age``."""
+        now = time.monotonic() if now is None else now
+        doomed = [k for k, ts in self.items() if isinstance(ts, (int, float)) and now - ts > max_age]
+        for k in doomed:
+            self.pop(k, None)
+        return len(doomed)
+
+
 class ThrottlingMiddleware(BaseMiddleware):
     """Per-user token bucket for commands and button presses.
 
@@ -74,18 +115,28 @@ class ThrottlingMiddleware(BaseMiddleware):
     together than ``rate`` seconds are dropped with a short notice.
     Reply-keyboard taps (plain-text menu labels) count as commands.
     Service messages (joins/leaves) are never throttled.
+
+    Memory: both per-user tables are :class:`BoundedDict` (``maxsize`` entries,
+    LRU) **and** idle entries are swept by :meth:`cleanup` on every scheduler
+    tick, so RAM stays flat however many distinct users talk to the bot.
     """
 
-    def __init__(self, rate: float = 0.5, burst: int = 5, metrics: Metrics | None = None) -> None:
+    def __init__(
+        self, rate: float = 0.5, burst: int = 5, metrics: Metrics | None = None, maxsize: int = BOUNDED_MAX
+    ) -> None:
         self.rate = rate
         self.burst = burst
         self.metrics = metrics
-        self._hits: dict[int, deque[float]] = defaultdict(lambda: deque(maxlen=burst))
-        self._warned: dict[int, float] = {}
+        self.maxsize = maxsize
+        self._hits: BoundedDict = BoundedDict(maxsize)  # user_id -> deque[monotonic]
+        self._warned: BoundedDict = BoundedDict(maxsize)  # user_id -> monotonic
 
     def _allowed(self, user_id: int) -> bool:
         now = time.monotonic()
-        hits = self._hits[user_id]
+        hits: deque[float] | None = self._hits.touch(user_id)
+        if hits is None:
+            hits = deque(maxlen=self.burst)
+            self._hits[user_id] = hits
         window = self.rate * self.burst
         while hits and now - hits[0] > window:
             hits.popleft()
@@ -93,6 +144,16 @@ class ThrottlingMiddleware(BaseMiddleware):
             return False
         hits.append(now)
         return True
+
+    def __len__(self) -> int:
+        return len(self._hits)
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "tracked_users": len(self._hits),
+            "maxsize": self.maxsize,
+            "evictions": self._hits.evictions + self._warned.evictions,
+        }
 
     async def __call__(self, handler: Handler, event: TelegramObject, data: dict[str, Any]) -> Any:
         user = None
@@ -110,7 +171,7 @@ class ThrottlingMiddleware(BaseMiddleware):
         if self.metrics:
             self.metrics.inc("throttled_total")
         now = time.monotonic()
-        if now - self._warned.get(user.id, 0) > 5:
+        if now - self._warned.touch(user.id, 0) > 5:
             self._warned[user.id] = now
             try:
                 if isinstance(event, CallbackQuery):
@@ -129,6 +190,7 @@ class ThrottlingMiddleware(BaseMiddleware):
         for uid in idle:
             self._hits.pop(uid, None)
             self._warned.pop(uid, None)
+        self._warned.expire(window * 4, now)
         return len(idle)
 
 
@@ -141,6 +203,10 @@ class CallbackAckMiddleware(BaseMiddleware):
     * If a handler finishes without calling ``call.answer()`` (or raises), we
       answer the callback ourselves so Telegram's loading spinner never hangs.
     """
+
+    #: Safety valve: in-flight keys are removed in ``finally`` so this never
+    #: grows in practice, but a hard cap guarantees it even if a task is lost.
+    MAX_INFLIGHT = BOUNDED_MAX
 
     def __init__(self, metrics: Metrics | None = None) -> None:
         self.metrics = metrics
@@ -162,6 +228,8 @@ class CallbackAckMiddleware(BaseMiddleware):
             except TelegramBadRequest:
                 pass
             return None
+        if len(self._inflight) >= self.MAX_INFLIGHT:
+            self._inflight.clear()  # better to allow a rare double tap than to leak forever
         self._inflight.add(key)
         answered = False
         original_answer = event.answer
@@ -198,7 +266,9 @@ class ErrorReportingMiddleware(BaseMiddleware):
         self.notify_ids = notify_ids
         self.bot_getter = bot_getter
         self.metrics = metrics
-        self._last_sent: dict[str, float] = {}
+        # error-signature -> last DM time; bounded so a flood of *distinct* error
+        # messages (e.g. with ids in the text) cannot grow it without limit
+        self._last_sent: BoundedDict = BoundedDict(BOUNDED_MAX)
 
     async def __call__(self, handler: Handler, event: TelegramObject, data: dict[str, Any]) -> Any:
         try:
@@ -211,7 +281,7 @@ class ErrorReportingMiddleware(BaseMiddleware):
                 self.metrics.last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
             key = f"{type(exc).__name__}:{str(exc)[:80]}"
             now = time.monotonic()
-            if self.notify_ids and now - self._last_sent.get(key, 0) > 300:
+            if self.notify_ids and now - self._last_sent.touch(key, 0) > 300:
                 self._last_sent[key] = now
                 bot = self.bot_getter()
                 text = (

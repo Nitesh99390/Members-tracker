@@ -137,14 +137,18 @@ def _parts(data: str) -> list[str]:
     return data.split(":")[1:]
 
 
-async def _admin_chats(db: Database, settings: Settings, user_id: int) -> list[Chat]:
-    if user_id in settings.super_admins:
-        return await db.list_chats()
-    return await db.chats_for_admin(user_id)
+def _picker_user(settings: Settings, user_id: int) -> int | None:
+    """``None`` for super-admins (they see every chat), else the admin's id."""
+    return None if user_id in settings.super_admins else user_id
+
+
+async def _count_admin_chats(db: Database, settings: Settings, user_id: int) -> int:
+    """Index-only ``COUNT(*)`` of the chats ``user_id`` may manage (no rows loaded)."""
+    return await db.count_admin_chats(_picker_user(settings, user_id))
 
 
 async def _show_dashboard(call: CallbackQuery, db: Database, settings: Settings, chat: Chat) -> None:
-    many = len(await _admin_chats(db, settings, call.from_user.id)) > 1
+    many = await _count_admin_chats(db, settings, call.from_user.id) > 1
     await _show(call, await S.dashboard_screen(db, chat, settings, many))
 
 
@@ -203,13 +207,13 @@ async def _input_chat(
 @router.callback_query(F.data == "home")
 async def cb_home(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
     await state.clear()
-    chats = await _admin_chats(db, settings, call.from_user.id)
-    is_admin_user = call.from_user.id in settings.super_admins or bool(chats)
+    has_chats = await _count_admin_chats(db, settings, call.from_user.id) > 0
+    is_admin_user = call.from_user.id in settings.super_admins or has_chats
     me = await bot.me()
     await _edit(
         call,
-        home_text(call.from_user.first_name, is_admin_user, bool(chats)),
-        K.home_keyboard(is_admin_user, me.username or "", bool(chats)),
+        home_text(call.from_user.first_name, is_admin_user, has_chats),
+        K.home_keyboard(is_admin_user, me.username or "", has_chats),
     )
     await call.answer()
 
@@ -254,8 +258,8 @@ async def cb_request_renewal(call: CallbackQuery, db: Database, settings: Settin
 async def cb_chats(call: CallbackQuery, db: Database, settings: Settings, state: FSMContext) -> None:
     """Chat picker; ``chats:<page>`` flips pages by editing the same message in place."""
     await state.clear()
-    chats = await _admin_chats(db, settings, call.from_user.id)
-    if not chats:
+    picker = _picker_user(settings, call.from_user.id)
+    if not await db.count_admin_chats(picker):
         await call.answer("No chats yet — add me to a group as admin.", show_alert=True)
         return
     page = 0
@@ -263,7 +267,8 @@ async def cb_chats(call: CallbackQuery, db: Database, settings: Settings, state:
     if len(parts) > 1 and parts[1].lstrip("-").isdigit():
         page = int(parts[1])
     current = await db.get_context(call.from_user.id)
-    await _show(call, await S.chats_screen(db, chats, current, page))
+    # one page (LIMIT 6 OFFSET ?) + COUNT(*) in SQL — never the whole chat list
+    await _show(call, await S.chats_screen_for(db, picker, current, page))
     await call.answer()
 
 
@@ -890,14 +895,16 @@ async def cb_pending_all(call: CallbackQuery, bot: Bot, db: Database, settings: 
     chat = await _authorised(call, bot, db, settings, chat_id)
     if not chat:
         return
-    items = await db.list_pending(chat_id, limit=200)
+    # stream pending joins in 100-row keyset batches — never one giant list in RAM
     done = 0
-    for p in items:
+    total = 0
+    async for p in db.iter_pending(chat_id):
+        total += 1
         ok, _ = await service.apply_decision(p, "default", call.from_user.id, call.from_user.full_name)
         done += int(ok)
-    await db.add_log(chat_id, None, "pending_bulk_default", f"{done}/{len(items)}", call.from_user.id)
+    await db.add_log(chat_id, None, "pending_bulk_default", f"{done}/{total}", call.from_user.id)
     await _show(call, await S.pending_screen(db, chat, settings))
-    await call.answer(f"Applied default to {done} of {len(items)}")
+    await call.answer(f"Applied default to {done} of {total}")
 
 
 # ------------------------------------------------------------ invite links
@@ -1182,26 +1189,26 @@ async def cb_export_view(call: CallbackQuery, bot: Bot, db: Database, settings: 
         return
     if view not in dict(X.EXPORT_VIEWS):
         view = "all"
-    members = await db.members_for_export(chat_id, view)
-    if not members:
+    if not await db.count_members_view(chat_id, view):  # index-only COUNT(*)
         await call.answer("Nothing to export for that selection.", show_alert=True)
         return
     await call.answer("Preparing file…")
-    data = X.members_csv(members, settings.tz)
+    # rows are streamed from SQLite in 100-row batches straight into the CSV writer
+    data, count = await X.export_chat_csv(db, chat_id, view, settings.tz)
     document = BufferedInputFile(data, filename=X.export_filename(chat, view))
     try:
         await tg_call(
             bot.send_document,
             call.message.chat.id,
             document,
-            caption=escape(X.export_caption(chat, view, len(members))),
+            caption=escape(X.export_caption(chat, view, count)),
             retries=1,
             label="send_export",
         )
     except (TelegramBadRequest, TelegramForbiddenError) as exc:
         await call.answer(f"Could not send the file: {exc.message}", show_alert=True)
         return
-    await db.add_log(chat_id, None, "export", f"{view} {len(members)} rows", call.from_user.id)
+    await db.add_log(chat_id, None, "export", f"{view} {count} rows", call.from_user.id)
 
 
 # ------------------------------------------------------------ misc buttons
@@ -1475,10 +1482,13 @@ async def _lookup_chat(message: Message, bot: Bot, db: Database, settings: Setti
     user_id = message.from_user.id
     chat_id = await db.get_context(user_id)
     if chat_id is None:
-        chats = await _admin_chats(db, settings, user_id)
-        if len(chats) != 1:
+        picker = _picker_user(settings, user_id)
+        if await db.count_admin_chats(picker) != 1:
             return None  # not an admin, or ambiguous → ignore silently
-        chat_id = chats[0].chat_id
+        only = await db.first_admin_chat(picker)
+        if only is None:
+            return None
+        chat_id = only.chat_id
         await db.set_context(user_id, chat_id)
     chat = await db.get_chat(chat_id)
     if not chat or not await is_admin(bot, db, settings, chat_id, user_id):
