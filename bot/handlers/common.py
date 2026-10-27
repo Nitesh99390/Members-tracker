@@ -21,9 +21,9 @@ from bot.services.membership import MembershipService
 from bot.utils.keyboards import (
     help_keyboard,
     home_keyboard,
-    main_menu_keyboard,
     mystatus_keyboard,
     open_private_keyboard,
+    remove_reply_keyboard,
 )
 from bot.utils.timeparse import format_dt, humanize_delta
 
@@ -89,7 +89,7 @@ HELP_TOPICS: dict[str, str] = {
         "<code>/setrenewals off</code> — members: <code>/renew</code> or 🙏 under a reminder\n\n"
         "<b>Durations</b>: <code>30d</code> <code>2w</code> <code>1m</code> <code>1y</code> <code>1m 15d</code> <code>never</code>\n"
         "<b>Dates</b>: <code>2025-12-31</code> · <code>31/12/2025 18:30</code>\n\n"
-        "<i>Tip: the bottom menu is always one tap away — use it to jump to any screen.</i>"
+        "<i>Tip: /chats opens the chat picker, 🏠 Home takes you back from any screen.</i>"
     ),
 }
 
@@ -109,7 +109,7 @@ def home_text(first_name: str, is_admin: bool, has_chats: bool) -> str:
         return (
             f"<b>👋 Welcome back, {name}</b> · {tag}\n\n"
             "Choose a chat to see its members, pending decisions and settings.\n"
-            "<i>Use the bottom menu to jump anywhere in one tap.</i>"
+            "<i>Everything is one tap away through the buttons below.</i>"
         )
     if is_admin:
         return (
@@ -128,11 +128,11 @@ async def cmd_start(message: Message, bot: Bot, db: Database, settings: Settings
     user = message.from_user
     is_admin, has_chats = await _is_admin_user(db, settings, user.id)
     me = await bot.me()
-    # Telegram allows one keyboard per message: the greeting carries the persistent
-    # bottom menu (installed/refreshed on every /start), the inline quick actions follow.
+    # The greeting also clears any bottom (reply) keyboard left over from older
+    # versions; the inline quick actions follow as a second message.
     await message.answer(
         home_text(user.first_name, is_admin, has_chats),
-        reply_markup=main_menu_keyboard(is_admin, has_chats),
+        reply_markup=remove_reply_keyboard(),
     )
     if is_admin and has_chats and (message.text or "").strip().endswith(" menu"):
         # deep link from a group ("Open dashboard") → jump straight to the chat list

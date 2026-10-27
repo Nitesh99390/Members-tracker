@@ -15,7 +15,6 @@ from bot.services.membership import MembershipService
 from bot.utils.keyboards import (
     dashboard_keyboard,
     join_prompt_keyboard,
-    main_menu_keyboard,
     open_private_keyboard,
 )
 from bot.utils.permissions import refresh_chat_admins
@@ -74,18 +73,15 @@ async def on_bot_membership(
     pending = await db.count_pending(chat.id)
     dm_markup = dashboard_keyboard(record, pending)
 
-    # Notify the admin who added the bot privately (works for channels too).
-    # Their bottom menu may still be the "no chats yet" variant from /start, so the
-    # first DM carries the full admin menu; the dashboard follows as a second message
-    # (Telegram allows only one keyboard per message).
+    # Notify the admin who added the bot privately (works for channels too):
+    # one DM carrying the summary and the dashboard buttons.
     notified: set[int] = set()
     for uid in (actor_id, owner_id):
         if not uid or uid in notified:
             continue
         await db.set_context(uid, chat.id)
-        if await service.dm_user(uid, text, reply_markup=main_menu_keyboard(True, True)):
+        if await service.dm_user(uid, text, reply_markup=dm_markup):
             notified.add(uid)
-            await service.dm_user(uid, "⚡ <b>Quick actions</b>", reply_markup=dm_markup)
     if not notified and chat.type != ChatType.CHANNEL:
         # nobody reachable in private → post once in the group with a button to the DM
         me = await bot.me()

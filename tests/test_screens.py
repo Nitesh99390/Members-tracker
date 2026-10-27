@@ -270,3 +270,22 @@ async def test_pending_invites_stats_logs_vips_tools(env):
 
     text, kb = S.tools_screen(chat)
     assert "Tools — VIP Club" in text and "📣 Broadcast" in _buttons(kb)
+
+
+@pytest.mark.asyncio
+async def test_chats_screen_pages_and_badges_only_visible(env):
+    db, chat, settings = env
+    chats = [chat]
+    for i in range(14):
+        chats.append(await db.upsert_chat(-200 - i, f"Group {i}", "supergroup", None, added_by=1))
+    text, kb = await S.chats_screen(db, chats, -100, page=0)
+    assert "page 1/2" in text
+    assert _buttons(kb)[0].startswith("▸ 👥 VIP Club · 3")
+    pager = kb.inline_keyboard[-2]
+    assert [b.text for b in pager] == ["·", "1/2", "Next ➡️"]
+
+    text, kb = await S.chats_screen(db, chats, -100, page=1)
+    assert "page 2/2" in text
+    assert sum(1 for row in kb.inline_keyboard for b in row if (b.callback_data or "").startswith("dash:")) == 5
+    assert [b.text for b in kb.inline_keyboard[-2]] == ["⬅️ Back", "2/2", "·"]
+    assert _buttons(kb)[-1] == "🏠 Home"

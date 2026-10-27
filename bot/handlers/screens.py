@@ -46,20 +46,24 @@ def _icon(chat: Chat) -> str:
 
 
 # ------------------------------------------------------------------- chats
-async def chats_screen(db: Database, chats: list[Chat], current: int | None) -> Screen:
-    """Chat picker with live badges (active members · pending prompts)."""
+async def chats_screen(db: Database, chats: list[Chat], current: int | None, page: int = 0) -> Screen:
+    """Paged chat picker (``K.CHATS_PAGE`` per page) with live badges (active · pending)."""
+    visible, page, total_pages = K.chats_page_slice(chats, page)
     badges: dict[int, tuple[int, int]] = {}
-    for chat in chats[:30]:
+    for chat in visible:
         badges[chat.chat_id] = (
             await db.count_members(chat.chat_id, "active"),
             await db.count_pending(chat.chat_id),
         )
     total_pending = sum(p for _, p in badges.values())
-    lines = ["📂 <b>Your chats</b>", ""]
+    title = "📂 <b>Your chats</b>"
+    if total_pages > 1:
+        title += f" · {len(chats)} · page {page + 1}/{total_pages}"
+    lines = [title, ""]
     if total_pending:
         lines.append(f"🔔 <b>{total_pending}</b> member{'s' if total_pending != 1 else ''} waiting for a decision.")
     lines.append("<i>Tap a chat to open its dashboard.</i>")
-    return "\n".join(lines), K.chats_keyboard(chats, current, badges)
+    return "\n".join(lines), K.chats_keyboard(chats, current, badges, page)
 
 
 # --------------------------------------------------------------- dashboard

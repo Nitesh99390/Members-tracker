@@ -23,7 +23,6 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, Message, TelegramObject, Update
 
 from bot.services.metrics import Metrics
-from bot.utils.keyboards import menu_key
 
 log = logging.getLogger(__name__)
 
@@ -100,7 +99,7 @@ class ThrottlingMiddleware(BaseMiddleware):
         is_command = False
         if isinstance(event, Message):
             user = event.from_user
-            is_command = bool(event.text and (event.text.startswith("/") or menu_key(event.text)))
+            is_command = bool(event.text and event.text.startswith("/"))
         elif isinstance(event, CallbackQuery):
             user = event.from_user
             is_command = True
