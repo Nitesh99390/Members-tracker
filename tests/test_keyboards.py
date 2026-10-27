@@ -79,8 +79,10 @@ def test_chats_keyboard_badges_and_clipping():
     long = _chat(chat_id=-1, title="A very very very long chat title that would overflow a button")
     kb = K.chats_keyboard([long, _chat(chat_id=-2, title="B", tracking_enabled=False)], -2, {-1: (120, 3), -2: (4, 0)})
     texts = _buttons(kb)
-    assert texts[0].endswith("· 120 · 🔔3") and "…" in texts[0]
+    # two-column grid: only the pending badge is shown, active count is dropped to keep labels short
+    assert texts[0].endswith("🔔3") and "…" in texts[0] and "120" not in texts[0]
     assert texts[1].startswith("▸ ") and "⏸" in texts[1] and "🔔" not in texts[1]
+    assert len(kb.inline_keyboard[0]) == 2  # both chats share one row
     _assert_button_limits(kb)
 
 
@@ -213,31 +215,33 @@ def test_quick_durations_exclude_default():
     assert len(K.quick_durations("never")) == 3
 
 
-def test_chats_keyboard_is_paged_10_per_page():
-    chats = [_chat(chat_id=-(i + 1), title=f"Chat {i + 1}") for i in range(25)]
-    # page 0: 10 chats + pager + home
+def test_chats_keyboard_is_botfather_style_grid():
+    chats = [_chat(chat_id=-(i + 1), title=f"Chat {i + 1}") for i in range(15)]
+    # page 0: 6 chats in 3 rows × 2 columns, then a single wide » button, then home
     kb = K.chats_keyboard(chats, None, page=0)
     texts, data = _buttons(kb), _data(kb)
-    assert sum(1 for d in data if d and d.startswith("dash:")) == K.CHATS_PAGE
+    assert sum(1 for d in data if d and d.startswith("dash:")) == K.CHATS_PAGE == 6
+    assert [len(r) for r in kb.inline_keyboard] == [2, 2, 2, 1, 1]
     assert texts[-1] == "🏠 Home" and data[-1] == "home"
     pager = kb.inline_keyboard[-2]
-    assert [b.text for b in pager] == ["·", "1/3", "Next ➡️"]
-    assert pager[2].callback_data == "chats:1"
+    assert [b.text for b in pager] == ["»"] and pager[0].callback_data == "chats:1"
     _assert_button_limits(kb)
 
-    # middle page: both arrows
+    # middle page: « and » share one row
     kb = K.chats_keyboard(chats, None, page=1)
     pager = kb.inline_keyboard[-2]
-    assert [b.text for b in pager] == ["⬅️ Back", "2/3", "Next ➡️"]
-    assert pager[0].callback_data == "chats:0" and pager[2].callback_data == "chats:2"
+    assert [b.text for b in pager] == ["«", "»"]
+    assert pager[0].callback_data == "chats:0" and pager[1].callback_data == "chats:2"
 
-    # last page: 5 chats, no "Next", page is clamped when out of range
+    # last page: 3 chats (2 rows), only «, page is clamped when out of range
     kb = K.chats_keyboard(chats, None, page=99)
-    assert sum(1 for d in _data(kb) if d and d.startswith("dash:")) == 5
+    assert sum(1 for d in _data(kb) if d and d.startswith("dash:")) == 3
+    assert [len(r) for r in kb.inline_keyboard] == [2, 1, 1, 1]
     pager = kb.inline_keyboard[-2]
-    assert [b.text for b in pager] == ["⬅️ Back", "3/3", "·"]
+    assert [b.text for b in pager] == ["«"] and pager[0].callback_data == "chats:1"
     assert _buttons(kb)[-1] == "🏠 Home"
 
     # a single page shows no pager at all
-    kb = K.chats_keyboard(chats[:10], None)
-    assert len(kb.inline_keyboard) == 11 and _buttons(kb)[-1] == "🏠 Home"
+    kb = K.chats_keyboard(chats[:6], None)
+    assert len(kb.inline_keyboard) == 4 and _buttons(kb)[-1] == "🏠 Home"
+

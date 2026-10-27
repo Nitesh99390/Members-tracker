@@ -196,8 +196,8 @@ async def test_dashboard_and_chats_screens(env):
     assert "Auto-remove is off" in text
 
     text, kb = await S.chats_screen(db, [chat], -100)
-    assert "Your chats" in text and "<b>1</b> member waiting" in text
-    assert _buttons(kb)[0].startswith("▸ 👥 VIP Club · 3 · 🔔1")
+    assert "Choose a chat" in text and "<b>1</b> member waiting" in text
+    assert _buttons(kb)[0].startswith("▸ 👥 VIP Club 🔔1")
 
 
 @pytest.mark.asyncio
@@ -278,14 +278,16 @@ async def test_chats_screen_pages_and_badges_only_visible(env):
     chats = [chat]
     for i in range(14):
         chats.append(await db.upsert_chat(-200 - i, f"Group {i}", "supergroup", None, added_by=1))
+    # 15 chats → 3 pages of 6 (BotFather-style 2-column grid with « / » pager)
     text, kb = await S.chats_screen(db, chats, -100, page=0)
-    assert "page 1/2" in text
-    assert _buttons(kb)[0].startswith("▸ 👥 VIP Club · 3")
+    assert "(1/3)" in text
+    assert _buttons(kb)[0].startswith("▸ 👥 VIP Club")
+    assert [len(r) for r in kb.inline_keyboard] == [2, 2, 2, 1, 1]
     pager = kb.inline_keyboard[-2]
-    assert [b.text for b in pager] == ["·", "1/2", "Next ➡️"]
+    assert [b.text for b in pager] == ["»"] and pager[0].callback_data == "chats:1"
 
-    text, kb = await S.chats_screen(db, chats, -100, page=1)
-    assert "page 2/2" in text
-    assert sum(1 for row in kb.inline_keyboard for b in row if (b.callback_data or "").startswith("dash:")) == 5
-    assert [b.text for b in kb.inline_keyboard[-2]] == ["⬅️ Back", "2/2", "·"]
+    text, kb = await S.chats_screen(db, chats, -100, page=2)
+    assert "(3/3)" in text
+    assert sum(1 for row in kb.inline_keyboard for b in row if (b.callback_data or "").startswith("dash:")) == 3
+    assert [b.text for b in kb.inline_keyboard[-2]] == ["«"]
     assert _buttons(kb)[-1] == "🏠 Home"

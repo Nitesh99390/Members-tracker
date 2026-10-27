@@ -23,7 +23,7 @@ Built with Python 3.11+, [aiogram 3](https://docs.aiogram.dev/), SQLite and APSc
 | **Whitelist / VIP** | Whitelisted users and chat admins are never removed. |
 | **Button-first dashboard** | Home → chat → dashboard → settings. Only the essentials on each screen; rarely used switches live under *Advanced*, power actions under *Tools*. Every screen has a 🏠 escape hatch. |
 | **Tappable member lists** | Tabs **Active · Expiring · Lifetime · Past** with live counts, one button per member (`🟢 Alice · 12d`, `🟠 Bob · 5h`, `♾ Carol · ∞`), pager, inline search — no IDs to type. Tap a row to open the card; *Back* returns to the same tab & page. |
-| **Manage channels from private chat** | Channels have no chat commands, so `/chats` lets admins pick a chat and manage it via DM. |
+| **Manage channels from private chat** | Channels have no chat commands, so `/chats` shows a BotFather-style 2-column chat grid (6 per page, `«` `»` pager) — tap a chat to manage it via DM. |
 | **Member cards** | `/info` (or a tap in the list) shows a card with one-tap **+1w / +1m / +3m / ♾ / Custom / More** buttons; *More* adds +6m, +1y, history, note, ask-owner, VIP, remove, untrack. |
 | **Copy & share links** | Invite links have native 📋 *copy* buttons (Telegram `copy_text`) and a 📤 *share* button; revoking asks for confirmation. |
 | **Audit logs** | Every action is stored and optionally mirrored to a log channel (`/setlog`). |
