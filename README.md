@@ -149,9 +149,8 @@ The bot is designed so that an owner almost never types a command:
 
 | Screen | What you see |
 |--------|--------------|
-| **Bottom menu** (persistent) | `📊 Dashboard` `👥 Members` · `🔔 Pending` `🔗 Invite links` · `⚙️ Settings` `📂 My chats` · `📖 Help` |
 | **Home** (`/start`) | `📂 My chats` · `➕ Add to group` · `📖 Help` |
-| **My chats** | One row per chat with live badges: `▸ 👥 VIP Club · 120 · 🔔3` (active members · pending prompts) |
+| **My chats** | One row per chat with live badges: `▸ 👥 VIP Club · 120 · 🔔3` (active members · pending prompts) · 10 chats per page with a `⬅️ Back · 1/4 · Next ➡️` pager that edits the message in place · `🏠 Home` on every page |
 | **Dashboard** | `👥 Members` `⏰ Expiring · n` · `🔔 Pending · n` `🔗 Invite links` · `📊 Overview` `📜 Activity` · `⚙️ Settings` `🛠 Tools` |
 | **Members** | Tabs `▸ 🟢 Active 30` `⏰ Expiring 2` `♾ Lifetime 1` `📁 Past 7` · tappable rows · `◀️ 2 / 4 ▶️` pager · `🔍 Search` `➕ Add member` |
 | **Tools** | `➕ Add member` `🔍 Search` · `📣 Broadcast` (with preview + confirm + progress bar) `🛡 VIP list` · `🔄 Sync` `🔁 Run expiry check` · `📥 Export CSV` `🔐 Check permissions` |
@@ -166,11 +165,7 @@ The bot is designed so that an owner almost never types a command:
 | **Activity** | Paged audit log (`◀️ Newer` / `Older ▶️`) |
 | **Help** | Short topic pages instead of a command wall |
 
-The **bottom menu** is a Telegram reply keyboard installed on `/start` (and refreshed the moment your first
-chat gets tracked). It adapts to the user: regular users see `📇 My memberships · 📖 Help`, admins without
-a chat see `➕ Add to group · 📖 Help`, admins with chats get the full menu. Every tap opens the same screen
-as the matching inline button and cancels any pending text input, so you can never get "stuck" in a flow.
-With one tracked chat it is auto-selected; with several, `📂 My chats` / a chat picker appears.
+There is no persistent bottom (reply) keyboard — every screen is reached through inline buttons, `/chats` opens the chat picker and `🏠 Home` is on every screen. With one tracked chat it is auto-selected; with several, the paged chat picker appears.
 
 Typing a **user ID or @username** in the private chat opens that member's card directly; any other short
 text (2–64 chars) is treated as a **name search** in the selected chat. Free-form values (custom dates,
@@ -226,7 +221,6 @@ bot/
   web.py                     # aiohttp side-car: /healthz /readyz /metrics + webhook receiver
   handlers/
     common.py                # /start /help /mystatus /renew /id
-    menu.py                  # persistent bottom-menu (reply keyboard) taps
     admin.py                 # admin commands
     callbacks.py             # inline button handlers + guided text inputs (FSM)
     screens.py               # every admin view rendered as (text, keyboard) — shared by commands, menu, callbacks

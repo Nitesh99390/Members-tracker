@@ -250,15 +250,20 @@ async def cb_request_renewal(call: CallbackQuery, db: Database, settings: Settin
     await call.answer(note, show_alert=True)
 
 
-@router.callback_query(F.data == "chats")
+@router.callback_query((F.data == "chats") | F.data.startswith("chats:"))
 async def cb_chats(call: CallbackQuery, db: Database, settings: Settings, state: FSMContext) -> None:
+    """Chat picker; ``chats:<page>`` flips pages by editing the same message in place."""
     await state.clear()
     chats = await _admin_chats(db, settings, call.from_user.id)
     if not chats:
         await call.answer("No chats yet — add me to a group as admin.", show_alert=True)
         return
+    page = 0
+    parts = (call.data or "").split(":")
+    if len(parts) > 1 and parts[1].lstrip("-").isdigit():
+        page = int(parts[1])
     current = await db.get_context(call.from_user.id)
-    await _show(call, await S.chats_screen(db, chats, current))
+    await _show(call, await S.chats_screen(db, chats, current, page))
     await call.answer()
 
 

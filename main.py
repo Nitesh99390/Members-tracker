@@ -35,7 +35,7 @@ from aiogram.types import (
 
 from bot import VERSION_TAG, __version__
 from bot.config import Settings
-from bot.handlers import admin, callbacks, common, menu, tracking
+from bot.handlers import admin, callbacks, common, tracking
 from bot.middlewares import (
     CallbackAckMiddleware,
     DependenciesMiddleware,
@@ -179,9 +179,7 @@ def build_dispatcher(
     dp.callback_query.middleware(throttle)
     dp.callback_query.middleware(CallbackAckMiddleware(metrics))
 
-    # order matters: reply-menu taps first (exact labels only, so they also cancel a pending
-    # FSM input), then callbacks (FSM text input), then commands, then service events
-    dp.include_router(menu.router)
+    # order matters: callbacks (FSM text input) first, then commands, then service events
     dp.include_router(callbacks.router)
     dp.include_router(common.router)
     dp.include_router(admin.router)

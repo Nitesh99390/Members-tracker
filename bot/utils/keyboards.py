@@ -15,11 +15,9 @@ from aiogram.types import (
     CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.services.database import Chat, InviteLink, Member, PendingJoin
 from bot.utils.ui import clip, page_label, short_delta, urgency
@@ -109,82 +107,12 @@ def _home() -> InlineKeyboardButton:
 
 
 # ------------------------------------------------------------ reply keyboard
-# Persistent bottom menu shown in the private chat. It mirrors the most used
-# inline actions so an admin can reach any screen with a single tap, even when
-# the last inline message has scrolled away.
-#
-# Button labels double as the routing key (Telegram sends them back as plain
-# text), so keep them unique and stable. ``MENU_*`` constants are the single
-# source of truth for both the keyboard and the message handler.
-MENU_CHATS = "📂 My chats"
-MENU_DASHBOARD = "📊 Dashboard"
-MENU_MEMBERS = "👥 Members"
-MENU_PENDING = "🔔 Pending"
-MENU_INVITES = "🔗 Invite links"
-MENU_SETTINGS = "⚙️ Settings"
-MENU_HELP = "📖 Help"
-MENU_STATUS = "📇 My memberships"
-MENU_ADD = "➕ Add to group"
-
-#: Every label the reply-keyboard router must react to.
-MENU_BUTTONS: frozenset[str] = frozenset(
-    {
-        MENU_CHATS,
-        MENU_DASHBOARD,
-        MENU_MEMBERS,
-        MENU_PENDING,
-        MENU_INVITES,
-        MENU_SETTINGS,
-        MENU_HELP,
-        MENU_STATUS,
-        MENU_ADD,
-    }
-)
-
-
-def _kbtn(text: str) -> KeyboardButton:
-    return KeyboardButton(text=text)
-
-
-def main_menu_keyboard(is_admin: bool, has_chats: bool) -> ReplyKeyboardMarkup:
-    """Persistent bottom menu for the private chat.
-
-    * regular user   → My memberships · Help
-    * admin, no chat → Add to group · Help
-    * admin + chats  → Dashboard / Members / Pending / Invite links / Settings / My chats / Help
-    """
-    kb = ReplyKeyboardBuilder()
-    if is_admin and has_chats:
-        kb.row(_kbtn(MENU_DASHBOARD), _kbtn(MENU_MEMBERS))
-        kb.row(_kbtn(MENU_PENDING), _kbtn(MENU_INVITES))
-        kb.row(_kbtn(MENU_SETTINGS), _kbtn(MENU_CHATS))
-        kb.row(_kbtn(MENU_HELP))
-        placeholder = "Tap a button, or send a user ID / @username / name"
-    elif is_admin:
-        kb.row(_kbtn(MENU_ADD), _kbtn(MENU_HELP))
-        placeholder = "Add me to a group to get started"
-    else:
-        kb.row(_kbtn(MENU_STATUS), _kbtn(MENU_HELP))
-        placeholder = "Pick an action"
-    return kb.as_markup(resize_keyboard=True, is_persistent=True, input_field_placeholder=placeholder)
-
-
+# The bot has no persistent bottom menu: every screen is reachable through
+# inline buttons. ``remove_reply_keyboard`` is still sent once on /start so
+# users who got the old bottom menu installed have it cleared.
 def remove_reply_keyboard() -> ReplyKeyboardRemove:
-    """Hide the bottom menu (e.g. when a user is no longer an admin anywhere)."""
+    """Hide any bottom menu left over from older versions."""
     return ReplyKeyboardRemove(remove_keyboard=True)
-
-
-def menu_key(text: str | None) -> str | None:
-    """Normalise a tapped reply-button label to its ``MENU_*`` constant.
-
-    Tolerates stray whitespace. Returns ``None`` for anything that is not a
-    menu button so ordinary text (IDs, @usernames, custom durations) passes
-    through untouched.
-    """
-    if not text:
-        return None
-    label = " ".join(text.split())
-    return label if label in MENU_BUTTONS else None
 
 
 def add_to_group_keyboard(bot_username: str) -> InlineKeyboardMarkup:
@@ -227,12 +155,36 @@ def open_private_keyboard(bot_username: str, text: str = "💬 Open dashboard") 
 
 
 # ------------------------------------------------------------------ chat pick
+#: Chat buttons per page in the "Your chats" picker.
+CHATS_PAGE = 10
+
+
+def chats_total_pages(count: int) -> int:
+    return max(1, (count + CHATS_PAGE - 1) // CHATS_PAGE)
+
+
+def chats_page_slice(chats: list[Chat], page: int) -> tuple[list[Chat], int, int]:
+    """Return ``(visible_chats, clamped_page, total_pages)`` for the picker."""
+    total_pages = chats_total_pages(len(chats))
+    page = min(max(0, page), total_pages - 1)
+    start = page * CHATS_PAGE
+    return chats[start : start + CHATS_PAGE], page, total_pages
+
+
 def chats_keyboard(
-    chats: list[Chat], current: int | None, badges: dict[int, tuple[int, int]] | None = None
+    chats: list[Chat],
+    current: int | None,
+    badges: dict[int, tuple[int, int]] | None = None,
+    page: int = 0,
 ) -> InlineKeyboardMarkup:
-    """One row per chat. ``badges`` = {chat_id: (active_members, pending)} adds live counters."""
+    """Paged chat picker: ``CHATS_PAGE`` rows, then ``⬅️ Back · n/N · Next ➡️``, then 🏠 Home.
+
+    ``badges`` = {chat_id: (active_members, pending)} adds live counters.
+    Pager taps use ``chats:<page>`` and edit the same message in place.
+    """
+    visible, page, total_pages = chats_page_slice(chats, page)
     kb = InlineKeyboardBuilder()
-    for chat in chats:
+    for chat in visible:
         prefix = "▸ " if chat.chat_id == current else ""
         icon = "📢" if chat.is_channel else "👥"
         state = "" if chat.tracking_enabled else " · ⏸"
@@ -243,6 +195,12 @@ def chats_keyboard(
             if pending:
                 extra += f" · 🔔{pending}"
         kb.row(_btn(f"{prefix}{icon} {clip(chat.display, 30)}{state}{extra}", f"dash:{chat.chat_id}"))
+    if total_pages > 1:
+        kb.row(
+            _btn("⬅️ Back", f"chats:{page - 1}") if page > 0 else _btn("·", "noop"),
+            _btn(f"{page + 1}/{total_pages}", "noop"),
+            _btn("Next ➡️", f"chats:{page + 1}") if page < total_pages - 1 else _btn("·", "noop"),
+        )
     kb.row(_btn("🏠 Home", "home"))
     return kb.as_markup()
 
