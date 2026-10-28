@@ -22,7 +22,8 @@ from aiogram.exceptions import (
 from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, User
 
 from bot.config import Settings
-from bot.services.database import STREAM_BATCH, Chat, Database, Member, PendingJoin
+from bot.services.database import INVITE_REVOKED, STREAM_BATCH, Chat, Database, Member, PendingJoin
+from bot.utils.invites import MAX_MEMBER_LIMIT, limit_label
 from bot.utils.keyboards import join_prompt_keyboard, renewal_prompt_keyboard, renewal_request_keyboard
 from bot.utils.telegram import TelegramUnavailable, error_text, tg_call, tg_try
 from bot.utils.timeparse import (
@@ -199,14 +200,21 @@ class MembershipService:
 
         ask = False
         link_label = ""
+        exhausted_now = None
         if expires_at is ...:
             preset = None
             if invite_link:
                 link = await self.db.get_invite_link(invite_link)
-                if link and not link.revoked:
+                # A manually revoked link no longer applies its preset. An
+                # *exhausted* one still does: Telegram enforces ``member_limit``
+                # itself, so a join we see through it was legitimately admitted.
+                if link and link.state != INVITE_REVOKED:
                     preset = link.duration
                     link_label = link.name or "invite link"
-                    await self.db.bump_invite_use(invite_link)
+                    was_exhausted = link.exhausted
+                    link = await self.db.bump_invite_use(invite_link) or link
+                    if link.exhausted and not was_exhausted:
+                        exhausted_now = link
                     source = f"invite:{link.name or 'link'}"
             if preset is not None:
                 try:
@@ -235,6 +243,16 @@ class MembershipService:
             + (f"🔗 Via: {escape(link_label)}\n" if link_label else "")
             + f"⏳ Expires: <b>{format_dt(expires_at, self.settings.tz)}</b>",
         )
+        if exhausted_now is not None:
+            await self.db.add_log(
+                chat.chat_id, None, "invite_exhausted", f"{exhausted_now.name}={exhausted_now.uses_label}", None
+            )
+            await self.send_log(
+                chat,
+                f"🎟 <b>Invite link used up</b> — {escape(exhausted_now.name or 'link')} "
+                f"({exhausted_now.uses_label})\n📍 {escape(chat.display)}\n"
+                "<i>Telegram no longer accepts joins through it.</i>",
+            )
         if ask:
             await self.ask_owner_about_member(chat, member, source="join")
         return member
@@ -857,23 +875,43 @@ class MembershipService:
 
     # ----------------------------------------------------------- invite links
     async def create_invite_link(
-        self, chat: Chat, duration: str, name: str | None, actor_id: int, join_request: bool = False
+        self,
+        chat: Chat,
+        duration: str,
+        name: str | None,
+        actor_id: int,
+        join_request: bool = False,
+        member_limit: int | None = None,
     ) -> tuple[str | None, str]:
-        """Create a Telegram invite link bound to a membership duration."""
+        """Create a Telegram invite link bound to a membership duration.
+
+        ``member_limit`` (1..99999, ``None`` = unlimited) is forwarded to
+        Telegram, which stops admitting people once it is reached; the bot
+        mirrors the counter in ``invite_links.uses`` and marks the link
+        *exhausted* on the last join. Telegram does not allow a usage cap on
+        links that create join requests.
+        """
         if not is_permanent(duration):
             try:
                 self.expiry_from_text(duration)
             except ParseError as exc:
                 return None, f"Invalid duration: {exc}"
+        if member_limit is not None:
+            if not 1 <= int(member_limit) <= MAX_MEMBER_LIMIT:
+                return None, f"Usage limit must be between 1 and {MAX_MEMBER_LIMIT}."
+            if join_request:
+                return None, "Telegram does not allow a usage limit on links that create join requests."
         label = (name or f"{describe_duration(duration)}")[:32]
+        kwargs: dict[str, Any] = {"name": label, "creates_join_request": join_request}
+        if member_limit is not None:
+            kwargs["member_limit"] = int(member_limit)
         try:
             link = await tg_call(
                 self.bot.create_chat_invite_link,
                 chat.chat_id,
-                name=label,
-                creates_join_request=join_request,
                 retries=2,
                 label="create_invite",
+                **kwargs,
             )
         except TelegramRetryAfter as exc:
             return None, f"Rate limited, retry in {exc.retry_after}s"
@@ -881,8 +919,12 @@ class MembershipService:
             return None, f"Telegram refused: {exc.message} (need 'Invite users via link' admin right)"
         except (TelegramNetworkError, TelegramUnavailable) as exc:
             return None, f"Network error: {exc}"
-        await self.db.add_invite_link(link.invite_link, chat.chat_id, label, duration, actor_id)
-        await self.db.add_log(chat.chat_id, None, "invite_created", f"{label}={duration}", actor_id)
+        await self.db.add_invite_link(
+            link.invite_link, chat.chat_id, label, duration, actor_id, member_limit=member_limit
+        )
+        await self.db.add_log(
+            chat.chat_id, None, "invite_created", f"{label}={duration} ({limit_label(member_limit)})", actor_id
+        )
         return link.invite_link, label
 
     async def revoke_invite_link(self, chat: Chat, invite_link: str, actor_id: int) -> tuple[bool, str]:

@@ -16,6 +16,7 @@ Built with Python 3.11+, [aiogram 3](https://docs.aiogram.dev/), SQLite and APSc
 | **Automatic tracking** | Detects joins/leaves in groups, supergroups and channels (via `chat_member` updates). Members present before the bot was added are picked up as soon as they post. |
 | **Ask-on-join prompt** | When someone joins, the bot DMs the **owner** (or all admins) a compact prompt: *Keep default*, three quick picks, *More options* (all presets + custom date) and *Remove*. Unanswered prompts fall back to the default duration after `ASK_TIMEOUT_HOURS`. |
 | **Invite links with preset duration** | `/invite 3m VIP` creates a Telegram invite link; anyone joining through it gets 3 months automatically – no prompt needed. |
+| **Invite usage limits** | Cap how many people may use a link: `/invite 1y once Founder` (single-use), `/invite 1m x10 Promo`, or pick **1 · 5 · 10 · 25 · 50 · 100 · custom** in the button flow. Telegram enforces the cap (`member_limit`); the bot mirrors it as `12/50 uses`, marks the link 🎟 *used up* on the last join and posts a note to the log channel. |
 | **Auto-remove on expiry** | Background scheduler removes expired members every 60 s (configurable). **Kick mode** (user can rejoin) or **Ban mode** (permanent). |
 | **Flexible durations** | `30d`, `1m` (calendar month), `2w`, `12h`, `1y`, `1m 15d`, or an **exact date** `2025-12-31`, `31/12/2025 18:30`, or `never`. |
 | **Per-chat defaults** | Each group/channel can have its own default duration; falls back to a global default. |
@@ -222,8 +223,8 @@ All commands still work; they are simply not advertised in the menu.
 ### Invite links
 | Command | Description |
 |---------|-------------|
-| `/invite <3m\|1y\|never> [label]` | Link with a preset membership length |
-| `/invites` · `/revoke <link>` | List / revoke |
+| `/invite <3m\|1y\|never> [x<n>\|once] [label]` | Link with a preset membership length and an optional usage cap (`x5`, `5x`, `limit=5`, `once`) |
+| `/invites` · `/revoke <link>` | List (with `n/limit uses` counters) / revoke |
 
 ### Super-admins: `/gstats` · `/backup` · `/health` &nbsp;&nbsp; Users: `/mystatus` · `/renew` · `/id` · `/help`
 
@@ -252,11 +253,12 @@ bot/
   utils/
     timeparse.py             # durations & dates parsing
     keyboards.py             # inline keyboards + bottom reply menu
+    invites.py               # invite-link usage limits: x5 / once parsing, labels, presets
     ui.py                    # pure presentation helpers: clip, urgency glyphs, compact deltas, progress bar
     permissions.py           # admin checks
     cache.py                 # TTL + LRU cache for hot read paths
     telegram.py              # tg_call / tg_try: retries for flood limits & network blips
-tests/                       # pytest suite (130 tests)
+tests/                       # pytest suite (196 tests)
 ```
 
 Run tests: `python -m pytest -q`

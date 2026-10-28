@@ -24,6 +24,7 @@ from aiogram.types import InlineKeyboardMarkup
 from bot.config import Settings
 from bot.services.database import Chat, Database, Member
 from bot.utils import keyboards as K
+from bot.utils.invites import limit_label
 from bot.utils.timeparse import describe_duration, format_dt, humanize_delta
 from bot.utils.ui import SOON_DAYS, clip, page_label
 
@@ -386,21 +387,52 @@ async def invites_screen(db: Database, chat: Chat) -> Screen:
             "no prompt, no manual work.\n\n<i>Tap ➕ New link to create one.</i>"
         )
     else:
+        used_up = 0
         for link in links[:8]:
+            used_up += int(link.exhausted)
+            mark = " · 🎟 used up" if link.exhausted else ""
             lines.append(
                 f"<b>{escape(link.name or K.preset_label(link.duration))}</b> · "
-                f"{escape(describe_duration(link.duration))} · {link.uses} joined"
+                f"{escape(describe_duration(link.duration))} · {link.uses_label}{mark}"
             )
         lines.append("")
-        lines.append("<i>📋 copies a link · 🗑 revokes it.</i>")
+        hint = "<i>📋 copies a link · 🗑 revokes it."
+        if used_up:
+            hint += " 🎟 links reached their usage limit — Telegram no longer accepts joins through them."
+        lines.append(hint + "</i>")
     return "\n".join(lines), K.invites_keyboard(chat, links)
 
 
-def invite_created_screen(chat: Chat, url: str, name: str, duration: str) -> Screen:
+def invite_limit_screen(chat: Chat, duration: str) -> Screen:
+    """Step 2 of *New link*: pick how many people may join through it."""
+    text = (
+        f"➕ <b>New invite link — {escape(chat.display)}</b>\n\n"
+        f"⏳ Duration: <b>{escape(describe_duration(duration))}</b>\n\n"
+        "How many people may join through this link?\n"
+        "<i>Telegram stops accepting joins once the limit is reached.</i>"
+    )
+    return text, K.invite_limit_keyboard(chat.chat_id, duration)
+
+
+def invite_created_screen(
+    chat: Chat, url: str, name: str, duration: str, member_limit: int | None = None
+) -> Screen:
+    if member_limit is None:
+        footer = "<i>Everyone joining through this link gets that duration automatically.</i>"
+    elif member_limit == 1:
+        footer = (
+            "<i>Single-use: the first person to join gets that duration, "
+            "then Telegram closes the link.</i>"
+        )
+    else:
+        footer = (
+            f"<i>Everyone joining through this link gets that duration automatically. "
+            f"Telegram closes it after {member_limit} joins.</i>"
+        )
     text = (
         f"🔗 <b>Invite link created — {escape(chat.display)}</b>\n\n"
-        f"📛 {escape(name)} · ⏳ <b>{escape(describe_duration(duration))}</b>\n\n"
-        f"<code>{escape(url)}</code>\n\n"
-        "<i>Everyone joining through this link gets that duration automatically.</i>"
+        f"📛 {escape(name)} · ⏳ <b>{escape(describe_duration(duration))}</b> · "
+        f"🎟 <b>{escape(limit_label(member_limit))}</b>\n\n"
+        f"<code>{escape(url)}</code>\n\n" + footer
     )
     return text, K.invite_created_keyboard(chat.chat_id, url)

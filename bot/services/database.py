@@ -133,8 +133,9 @@ CREATE TABLE IF NOT EXISTS invite_links (
     duration     TEXT NOT NULL,             -- duration text or 'never'
     created_by   INTEGER,
     created_at   TEXT NOT NULL,
-    uses         INTEGER NOT NULL DEFAULT 0,
-    revoked      INTEGER NOT NULL DEFAULT 0
+    uses         INTEGER NOT NULL DEFAULT 0,          -- joins seen through this link
+    revoked      INTEGER NOT NULL DEFAULT 0,          -- 0 active | 1 revoked | 2 exhausted (limit reached)
+    member_limit INTEGER                               -- NULL => unlimited (Telegram: 1..99999)
 );
 CREATE INDEX IF NOT EXISTS idx_invite_chat ON invite_links(chat_id);
 
@@ -156,7 +157,14 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("members", "fail_count", "INTEGER NOT NULL DEFAULT 0"),
     ("members", "source", "TEXT"),  # join | request | invite:<link> | manual
     ("members", "renewals", "INTEGER NOT NULL DEFAULT 0"),
+    ("invite_links", "uses", "INTEGER NOT NULL DEFAULT 0"),  # defensive: very old DBs
+    ("invite_links", "member_limit", "INTEGER"),  # NULL => unlimited usage
 ]
+
+#: ``invite_links.revoked`` values.
+INVITE_ACTIVE = 0
+INVITE_REVOKED = 1
+INVITE_EXHAUSTED = 2  # ``member_limit`` reached — Telegram stops accepting joins too
 
 # Indexes created *after* the first release on columns that are themselves
 # added by MIGRATIONS (so they cannot live in SCHEMA).
@@ -386,10 +394,14 @@ class InviteLink:
     created_by: int | None
     created_at: datetime
     uses: int
-    revoked: bool
+    revoked: bool  # True for *both* manually revoked and exhausted links
+    member_limit: int | None = None  # None => unlimited
+    state: int = INVITE_ACTIVE  # raw ``revoked`` column: 0 active | 1 revoked | 2 exhausted
 
     @classmethod
     def from_row(cls, row: aiosqlite.Row) -> InviteLink:
+        state = int(row["revoked"] or 0)
+        limit = _row_get(row, "member_limit")
         return cls(
             invite_link=row["invite_link"],
             chat_id=row["chat_id"],
@@ -398,8 +410,38 @@ class InviteLink:
             created_by=row["created_by"],
             created_at=from_iso(row["created_at"]) or utcnow(),
             uses=int(row["uses"] or 0),
-            revoked=bool(row["revoked"]),
+            revoked=bool(state),
+            member_limit=int(limit) if limit else None,
+            state=state,
         )
+
+    @property
+    def exhausted(self) -> bool:
+        """Usage cap reached (either flagged in the DB or by the counters)."""
+        if self.state == INVITE_EXHAUSTED:
+            return True
+        return self.member_limit is not None and self.uses >= self.member_limit
+
+    @property
+    def remaining(self) -> int | None:
+        """Joins still allowed, or ``None`` for unlimited links."""
+        if self.member_limit is None:
+            return None
+        return max(0, self.member_limit - self.uses)
+
+    @property
+    def uses_label(self) -> str:
+        """``12/50 uses`` for capped links, ``7 joined`` for unlimited ones."""
+        if self.member_limit is None:
+            return f"{self.uses} joined"
+        return f"{min(self.uses, self.member_limit)}/{self.member_limit} uses"
+
+    @property
+    def uses_short(self) -> str:
+        """Compact counter for button labels: ``12/50`` or ``7``."""
+        if self.member_limit is None:
+            return str(self.uses)
+        return f"{min(self.uses, self.member_limit)}/{self.member_limit}"
 
 
 class Database:
@@ -577,11 +619,20 @@ class Database:
                 log.debug("optimize failed: %s", exc)
 
     async def backup_to(self, dest: str) -> str:
-        """Create a consistent copy of the database file at ``dest``."""
+        """Create a consistent snapshot of the database at ``dest``.
+
+        Uses SQLite's *online backup API* (``sqlite3.Connection.backup``) rather
+        than copying the file: in WAL mode the ``.db`` file alone is incomplete
+        while frames still sit in ``-wal``, and a raw copy taken mid-transaction
+        may be corrupt. The backup API reads a transactionally consistent image
+        (WAL frames included) page by page, so RAM stays flat however large the
+        database is. The write lock only keeps our own writer quiet meanwhile.
+        """
         Path(dest).parent.mkdir(parents=True, exist_ok=True)
         async with self._write_lock:
             async with aiosqlite.connect(dest) as target:
-                await self.conn.backup(target)
+                await self.conn.backup(target, pages=256)
+                await target.commit()
         return dest
 
     async def healthcheck(self) -> bool:
@@ -1282,12 +1333,19 @@ class Database:
 
     # ----------------------------------------------------------- invite links
     async def add_invite_link(
-        self, invite_link: str, chat_id: int, name: str | None, duration: str, created_by: int | None
+        self,
+        invite_link: str,
+        chat_id: int,
+        name: str | None,
+        duration: str,
+        created_by: int | None,
+        member_limit: int | None = None,
     ) -> InviteLink:
         await self._exec(
-            """INSERT OR REPLACE INTO invite_links (invite_link, chat_id, name, duration, created_by, created_at, uses, revoked)
-               VALUES (?, ?, ?, ?, ?, ?, 0, 0)""",
-            (invite_link, chat_id, name, duration, created_by, to_iso(utcnow())),
+            """INSERT OR REPLACE INTO invite_links
+               (invite_link, chat_id, name, duration, created_by, created_at, uses, revoked, member_limit)
+               VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)""",
+            (invite_link, chat_id, name, duration, created_by, to_iso(utcnow()), member_limit or None),
         )
         link = await self.get_invite_link(invite_link)
         assert link is not None
@@ -1297,18 +1355,53 @@ class Database:
         row = await self._fetchone("SELECT * FROM invite_links WHERE invite_link=?", (invite_link,))
         return InviteLink.from_row(row) if row else None
 
-    async def list_invite_links(self, chat_id: int, include_revoked: bool = False) -> list[InviteLink]:
+    async def list_invite_links(
+        self, chat_id: int, include_revoked: bool = False, include_exhausted: bool = True, limit: int = 50
+    ) -> list[InviteLink]:
+        """Newest-first links of a chat (bounded page).
+
+        Manually revoked links are hidden unless ``include_revoked``; links that
+        merely ran out of uses stay listed (``1/1 uses``) so the admin can see
+        they were consumed, unless ``include_exhausted=False``.
+        """
         sql = "SELECT * FROM invite_links WHERE chat_id=?"
-        if not include_revoked:
-            sql += " AND revoked=0"
-        rows = await self._fetchall(sql + " ORDER BY created_at DESC", (chat_id,))
+        if include_revoked:
+            pass
+        elif include_exhausted:
+            sql += f" AND revoked<>{INVITE_REVOKED}"
+        else:
+            sql += f" AND revoked={INVITE_ACTIVE}"
+        rows = await self._fetchall(sql + " ORDER BY created_at DESC LIMIT ?", (chat_id, limit))
         return [InviteLink.from_row(r) for r in rows]
 
-    async def bump_invite_use(self, invite_link: str) -> None:
-        await self._exec("UPDATE invite_links SET uses=uses+1 WHERE invite_link=?", (invite_link,))
+    async def count_invite_links(self, chat_id: int) -> int:
+        """Links that can still be used (not revoked, not exhausted)."""
+        return await self._count(
+            f"SELECT COUNT(*) FROM invite_links WHERE chat_id=? AND revoked={INVITE_ACTIVE}", (chat_id,)
+        )
+
+    async def bump_invite_use(self, invite_link: str) -> InviteLink | None:
+        """Count one join through ``invite_link``; flips it to *exhausted* when the cap is hit.
+
+        A single ``UPDATE`` keeps counter and state change atomic, so two joins
+        arriving at once can never both see "one use left". Returns the refreshed
+        row (``None`` when the link is unknown).
+        """
+        await self._exec(
+            f"""UPDATE invite_links
+                SET uses = uses + 1,
+                    revoked = CASE
+                        WHEN revoked = {INVITE_ACTIVE} AND member_limit IS NOT NULL AND uses + 1 >= member_limit
+                        THEN {INVITE_EXHAUSTED} ELSE revoked END
+                WHERE invite_link=?""",
+            (invite_link,),
+        )
+        return await self.get_invite_link(invite_link)
 
     async def revoke_invite_link(self, invite_link: str) -> None:
-        await self._exec("UPDATE invite_links SET revoked=1 WHERE invite_link=?", (invite_link,))
+        await self._exec(
+            f"UPDATE invite_links SET revoked={INVITE_REVOKED} WHERE invite_link=?", (invite_link,)
+        )
 
     # --------------------------------------------------------------------- kv
     async def kv_set(self, key: str, value: str) -> None:
@@ -1331,7 +1424,7 @@ class Database:
             "expired": "SELECT COUNT(*) FROM members WHERE status='expired'",
             "total": "SELECT COUNT(*) FROM members",
             "pending": "SELECT COUNT(*) FROM pending_joins WHERE status='pending'",
-            "invites": "SELECT COUNT(*) FROM invite_links WHERE revoked=0",
+            "invites": f"SELECT COUNT(*) FROM invite_links WHERE revoked={INVITE_ACTIVE}",
         }.items():
             row = await self._fetchone(sql)
             out[key] = int(row[0]) if row else 0

@@ -26,6 +26,7 @@ from bot.services.database import Chat, Database, Member
 from bot.services.membership import MembershipService
 from bot.services.metrics import Metrics
 from bot.services.scheduler import ExpiryScheduler
+from bot.utils.invites import LimitError, split_limit
 from bot.utils.keyboards import (
     chats_keyboard,
     grace_label,
@@ -760,21 +761,37 @@ async def cmd_invite(
     settings: Settings,
     service: MembershipService,
 ) -> None:
-    """/invite <duration|never> [name] — create an invite link with a preset membership length."""
+    """/invite <duration|never> [x<n>|once] [name] — invite link with a preset membership length.
+
+    An optional usage limit (``x5``, ``5x``, ``limit=5`` or ``once``) may appear
+    anywhere after the duration; Telegram closes the link once that many
+    people have joined.
+    """
     chat = await resolve_chat(message, bot, db, settings)
     if not chat:
         return
     args = (command.args or "").split(maxsplit=1)
     if not args:
-        await _usage(message, "/invite &lt;1m | 3m | 1y | never&gt; [label]  e.g. <code>/invite 3m Gold plan</code>")
+        await _usage(
+            message,
+            "/invite &lt;1m | 3m | 1y | never&gt; [x&lt;uses&gt; | once] [label]\n"
+            "e.g. <code>/invite 3m Gold plan</code> · <code>/invite 1y once Founder</code> · "
+            "<code>/invite 1m x10 Promo</code>",
+        )
         return
     duration = args[0].lower()
-    name = args[1].strip() if len(args) > 1 else None
-    url, msg = await service.create_invite_link(chat, duration, name, message.from_user.id)
+    try:
+        name, member_limit = split_limit(args[1] if len(args) > 1 else None)
+    except LimitError as exc:
+        await message.reply(f"❌ {escape(str(exc))}")
+        return
+    url, msg = await service.create_invite_link(
+        chat, duration, name, message.from_user.id, member_limit=member_limit
+    )
     if not url:
         await message.reply(f"❌ {escape(msg)}")
         return
-    text, markup = S.invite_created_screen(chat, url, msg, duration)
+    text, markup = S.invite_created_screen(chat, url, msg, duration, member_limit)
     await message.reply(text, reply_markup=markup if message.chat.type == ChatType.PRIVATE else None)
 
 
@@ -784,10 +801,10 @@ async def cmd_invites(message: Message, bot: Bot, db: Database, settings: Settin
     if not chat:
         return
     if message.chat.type != ChatType.PRIVATE:
-        links = await db.list_invite_links(chat.chat_id)
+        active = await db.count_invite_links(chat.chat_id)
         me = await bot.me()
         await message.reply(
-            f"🔗 {len(links)} active invite link(s). Manage them privately.",
+            f"🔗 {active} active invite link(s). Manage them privately.",
             reply_markup=open_private_keyboard(me.username or ""),
         )
         return

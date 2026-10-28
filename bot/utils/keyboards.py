@@ -20,6 +20,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.services.database import Chat, InviteLink, Member, PendingJoin
+from bot.utils.invites import LIMIT_PRESETS
 from bot.utils.ui import clip, page_label, short_delta, urgency
 
 # Full list of presets (used by "more options" screens)
@@ -537,8 +538,11 @@ def invites_keyboard(chat: Chat, links: list[InviteLink]) -> InlineKeyboardMarku
     kb.row(_btn("➕ New link", f"inpick:{cid}"))
     for link in links[:8]:
         label = clip(link.name or preset_label(link.duration), 18)
+        # Exhausted links can no longer be used, so copying them is pointless;
+        # keep the row (the admin sees it was consumed) but swap the icon.
+        icon = "🎟" if link.exhausted else "📋"
         kb.row(
-            _copy(f"📋 {label} · {link.uses}", link.invite_link),
+            _copy(f"{icon} {label} · {link.uses_short}", link.invite_link),
             _btn("🗑", f"irev:{cid}:{link.invite_link[-22:]}"),
         )
     kb.row(_btn("◀️ Dashboard", f"dash:{cid}"), _home())
@@ -560,6 +564,20 @@ def invite_pick_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     kb.adjust(4)
     kb.row(_btn("✏️ Custom duration + label", f"incust:{chat_id}"))
     kb.row(_btn("◀️ Back", f"invites:{chat_id}"))
+    return kb.as_markup()
+
+
+def invite_limit_keyboard(chat_id: int, duration: str) -> InlineKeyboardMarkup:
+    """Second step of *New link*: how many people may join through it.
+
+    ``inewl:<cid>:<duration>:<n>`` creates the link; ``n = 0`` means unlimited.
+    """
+    kb = InlineKeyboardBuilder()
+    for label, value in LIMIT_PRESETS:
+        kb.button(text=label, callback_data=f"inewl:{chat_id}:{duration}:{value or 0}")
+    kb.adjust(1, 3, 3)
+    kb.row(_btn("✏️ Custom limit", f"inlimc:{chat_id}:{duration}"))
+    kb.row(_btn("◀️ Back", f"inpick:{chat_id}"))
     return kb.as_markup()
 
 

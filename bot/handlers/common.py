@@ -60,8 +60,13 @@ HELP_TOPICS: dict[str, str] = {
         "<b>🔗 Invite links</b>\n\n"
         "Create a link with a preset duration (e.g. 3 months). Everyone who joins through "
         "it gets exactly that duration — no prompt, no manual work.\n\n"
+        "Optionally cap how many people may use it (<i>1 use</i> for a single buyer, "
+        "<i>50 uses</i> for a promo). Telegram closes the link once the cap is reached and "
+        "the list shows <code>12/50 uses</code> so you always know what is left.\n\n"
         "Perfect for selling plans: one link per plan, share it after payment.\n\n"
-        "Dashboard → <b>🔗 Invite links</b> → <b>➕ New link</b>"
+        "Dashboard → <b>🔗 Invite links</b> → <b>➕ New link</b> → duration → usage limit\n"
+        "or <code>/invite 3m Gold</code> · <code>/invite 1y once Founder</code> · "
+        "<code>/invite 1m x10 Promo</code>"
     ),
     "settings": (
         "<b>⚙️ Settings explained</b>\n\n"
