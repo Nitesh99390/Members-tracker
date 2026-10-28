@@ -34,7 +34,7 @@ from bot.utils.keyboards import (
     open_private_keyboard,
     settings_keyboard,
 )
-from bot.utils.permissions import bot_can_restrict, is_admin
+from bot.utils.permissions import bot_can_restrict, is_admin, verify_admin_live
 from bot.utils.timeparse import (
     ParseError,
     describe_duration,
@@ -168,6 +168,11 @@ async def cmd_chats(message: Message, bot: Bot, db: Database, settings: Settings
             await db.set_context(user_id, current)
     if current and cmd in ("panel", "settings", "menu", "dashboard"):
         chat = await db.get_chat(current)
+        # Live Telegram check: the selected chat's dashboard is shown only to a
+        # real creator/administrator (or a super-admin) — never on cache alone.
+        if chat and not await verify_admin_live(bot, db, settings, chat.chat_id, user_id):
+            await message.answer("⛔ You are no longer an admin of that chat.")
+            return
         if chat:
             if cmd == "settings":
                 text, markup = S.settings_screen(chat, settings)
@@ -769,6 +774,10 @@ async def cmd_invite(
     """
     chat = await resolve_chat(message, bot, db, settings)
     if not chat:
+        return
+    # Invite links grant access to the chat: require a *live* Telegram admin check.
+    if not await verify_admin_live(bot, db, settings, chat.chat_id, message.from_user.id):
+        await message.reply("⛔ Only current admins of this chat can create invite links.")
         return
     args = (command.args or "").split(maxsplit=1)
     if not args:
