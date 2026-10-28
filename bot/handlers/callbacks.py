@@ -11,7 +11,8 @@ tapping, typing is only needed for free-form values (custom dates, texts):
 ``set``/``dur``/``edit``/``editclr``/``editlog`` settings & editors
 ``pending``/``pall``/``pallc``/``jd``/``jm``/``jr``/``jb``/``jc`` join & renewal prompts
 ``rq``       ``rq:<cid>`` member asks the admins for a renewal (from /mystatus or a reminder DM)
-``invites``/``inpick``/``inew``/``incust``/``irev``/``irevc`` invite links
+``invites``/``inpick``/``inew``/``inewl``/``inlimc``/``incust``/``irev``/``irevc`` invite links
+             (``inew`` picks a duration → ``inewl:<cid>:<dur>:<n>`` picks a usage limit, 0 = unlimited)
 ``addm``/``search``/``bcast``/``bcastc``/``vips``/``sync``/``fcheck``/``perms`` tools
 ``export``   ``export:<cid>`` scope picker · ``exportv:<cid>:<view>`` send the CSV
 ===========  ======================================================
@@ -44,6 +45,7 @@ from bot.services.database import Chat, Database
 from bot.services.membership import MembershipService
 from bot.services.scheduler import ExpiryScheduler
 from bot.utils import keyboards as K
+from bot.utils.invites import MAX_MEMBER_LIMIT, LimitError, limit_label, split_limit
 from bot.utils.permissions import bot_can_restrict, is_admin
 from bot.utils.telegram import is_not_modified, tg_call
 from bot.utils.timeparse import (
@@ -72,6 +74,7 @@ class CustomInput(StatesGroup):
     log_chat = State()  # data: chat_id
     chat_duration = State()  # data: chat_id
     invite_custom = State()  # data: chat_id
+    invite_limit = State()  # data: chat_id, duration
 
 
 INPUT_HINT = (
@@ -935,20 +938,60 @@ async def cb_invite_pick(call: CallbackQuery, bot: Bot, db: Database, settings: 
 
 
 @router.callback_query(F.data.startswith("inew:"))
-async def cb_invite_new(
-    call: CallbackQuery, bot: Bot, db: Database, settings: Settings, service: MembershipService
-) -> None:
+async def cb_invite_new(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
+    """Duration picked → ask how many people may use the link."""
     chat_id_s, value = _ids(call.data, 2)
     chat_id = int(chat_id_s)
     chat = await _authorised(call, bot, db, settings, chat_id)
     if not chat:
         return
-    url, msg = await service.create_invite_link(chat, value, None, call.from_user.id)
+    await state.clear()
+    await _show(call, S.invite_limit_screen(chat, value))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("inewl:"))
+async def cb_invite_new_limited(
+    call: CallbackQuery, bot: Bot, db: Database, settings: Settings, service: MembershipService
+) -> None:
+    """``inewl:<cid>:<duration>:<limit>`` — create the link (``0`` = unlimited)."""
+    chat_id_s, value, limit_s = _ids(call.data, 3)
+    chat_id = int(chat_id_s)
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    member_limit = int(limit_s) or None
+    url, msg = await service.create_invite_link(chat, value, None, call.from_user.id, member_limit=member_limit)
     if not url:
         await call.answer(msg, show_alert=True)
         return
-    await _show(call, S.invite_created_screen(chat, url, msg, value))
-    await call.answer(f"Created · {K.preset_label(value)}")
+    await _show(call, S.invite_created_screen(chat, url, msg, value, member_limit))
+    await call.answer(f"Created · {K.preset_label(value)} · {limit_label(member_limit)}")
+
+
+@router.callback_query(F.data.startswith("inlimc:"))
+async def cb_invite_limit_custom(
+    call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext
+) -> None:
+    """Ask for a typed usage limit for an already chosen duration."""
+    chat_id_s, value = _ids(call.data, 2)
+    chat_id = int(chat_id_s)
+    chat = await _authorised(call, bot, db, settings, chat_id)
+    if not chat:
+        return
+    await _begin_input(
+        call,
+        state,
+        CustomInput.invite_limit,
+        f"🎟 <b>Usage limit — {escape(chat.display)}</b>\n\n"
+        f"⏳ Duration: <b>{escape(describe_duration(value))}</b>\n\n"
+        f"Send how many people may join through this link (1–{MAX_MEMBER_LIMIT}), "
+        "optionally followed by a label, e.g.\n"
+        "<code>20</code> · <code>1 Founder seat</code> · <code>250 Launch promo</code>",
+        f"inpick:{chat_id}",
+        chat_id=chat_id,
+        duration=value,
+    )
 
 
 @router.callback_query(F.data.startswith("incust:"))
@@ -962,8 +1005,10 @@ async def cb_invite_custom(call: CallbackQuery, bot: Bot, db: Database, settings
         state,
         CustomInput.invite_custom,
         f"✏️ <b>Custom invite link — {escape(chat.display)}</b>\n\n"
-        "Send the duration followed by an optional label, e.g.\n"
-        "<code>3m Gold plan</code> · <code>45d Trial</code> · <code>never Founders</code>",
+        "Send the duration, an optional usage limit and an optional label, e.g.\n"
+        "<code>3m Gold plan</code> · <code>45d Trial</code> · <code>never Founders</code>\n"
+        "<code>1y once Founder seat</code> · <code>1m x10 Promo</code>\n\n"
+        "<i>Limit forms: <code>x5</code> · <code>5x</code> · <code>limit=5</code> · <code>once</code></i>",
         f"invites:{chat_id}",
         chat_id=chat_id,
     )
@@ -983,7 +1028,7 @@ async def cb_invite_revoke_confirm(call: CallbackQuery, bot: Bot, db: Database, 
     await _edit(
         call,
         f"🗑 <b>Revoke this link?</b>\n\n<b>{escape(target.name or K.preset_label(target.duration))}</b> · "
-        f"{target.uses} joined\n<code>{escape(target.invite_link)}</code>\n\n"
+        f"{target.uses_label}\n<code>{escape(target.invite_link)}</code>\n\n"
         "<i>Members who already joined keep their duration.</i>",
         K.invite_revoke_confirm_keyboard(chat_id, suffix),
     )
@@ -1463,13 +1508,49 @@ async def on_invite_custom_text(
     if not parts:
         return
     duration = parts[0].lower()
-    name = parts[1].strip() if len(parts) > 1 else None
-    url, msg = await service.create_invite_link(chat, duration, name, message.from_user.id)
+    try:
+        name, member_limit = split_limit(parts[1] if len(parts) > 1 else None)
+    except LimitError as exc:
+        await message.reply(f"⚠️ {escape(str(exc))}\nTry again (e.g. <code>3m x5 Gold plan</code>) or /cancel.")
+        return
+    url, msg = await service.create_invite_link(chat, duration, name, message.from_user.id, member_limit=member_limit)
     if not url:
         await message.reply(f"⚠️ {escape(msg)}\nTry again (e.g. <code>3m Gold plan</code>) or /cancel.")
         return
     await state.clear()
-    text, markup = S.invite_created_screen(chat, url, msg, duration)
+    text, markup = S.invite_created_screen(chat, url, msg, duration, member_limit)
+    await message.answer(text, reply_markup=markup)
+
+
+@router.message(CustomInput.invite_limit, *PRIVATE_TEXT)
+async def on_invite_limit_text(
+    message: Message, bot: Bot, db: Database, settings: Settings, service: MembershipService, state: FSMContext
+) -> None:
+    """Typed usage limit (``20`` or ``20 Launch promo``) for a preset duration."""
+    chat = await _input_chat(message, bot, db, settings, state)
+    if not chat:
+        return
+    data = await state.get_data()
+    duration = str(data.get("duration") or "")
+    parts = (message.text or "").split(maxsplit=1)
+    if not parts or not duration:
+        await state.clear()
+        return
+    raw = parts[0].strip().lstrip("x×*").rstrip("x×")
+    if not raw.isdigit() or not 1 <= int(raw) <= MAX_MEMBER_LIMIT:
+        await message.reply(
+            f"⚠️ Send a number between 1 and {MAX_MEMBER_LIMIT} (e.g. <code>20</code> or "
+            "<code>20 Launch promo</code>) or /cancel."
+        )
+        return
+    member_limit = int(raw)
+    name = parts[1].strip() if len(parts) > 1 else None
+    url, msg = await service.create_invite_link(chat, duration, name, message.from_user.id, member_limit=member_limit)
+    if not url:
+        await message.reply(f"⚠️ {escape(msg)}\nTry again or /cancel.")
+        return
+    await state.clear()
+    text, markup = S.invite_created_screen(chat, url, msg, duration, member_limit)
     await message.answer(text, reply_markup=markup)
 
 
