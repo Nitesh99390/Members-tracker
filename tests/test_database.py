@@ -181,3 +181,36 @@ async def test_backup_and_delete_chat(db: Database, tmp_path):
     await db.delete_chat(-700)
     assert await db.get_chat(-700) is None
     assert await db.get_member(-700, 1) is None
+
+
+@pytest.mark.asyncio
+async def test_backup_gzip_is_consistent_and_compressed(db: Database, tmp_path):
+    """Online backup API + gzip: the archive must be a complete, WAL-safe snapshot."""
+    import gzip
+    import sqlite3
+
+    await db.upsert_chat(-701, "Gz", "supergroup", None)
+    for uid in range(1, 51):
+        await db.upsert_member(-701, uid, f"User {uid}", None, None)
+    # WAL mode: rows above may still sit in -wal, a raw file copy would miss them
+    assert (await db._fetchone("PRAGMA journal_mode"))[0] == "wal"
+
+    dest = tmp_path / "backups" / "bot_2026-01-01.db.gz"
+    out = await db.backup_gzip(str(dest))
+    assert out == str(dest) and dest.exists()
+    assert not dest.with_name("bot_2026-01-01.db.tmp").exists()  # temp snapshot removed
+    assert dest.read_bytes()[:2] == b"\x1f\x8b"  # gzip magic
+
+    restored = tmp_path / "restored.db"
+    with gzip.open(dest, "rb") as fin, open(restored, "wb") as fout:
+        fout.write(fin.read())
+    con = sqlite3.connect(restored)
+    try:
+        assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert con.execute("SELECT COUNT(*) FROM members WHERE chat_id=-701").fetchone()[0] == 50
+    finally:
+        con.close()
+
+    # extension is normalised to .db.gz
+    other = await db.backup_gzip(str(tmp_path / "plain.db"))
+    assert other.endswith("plain.db.gz")

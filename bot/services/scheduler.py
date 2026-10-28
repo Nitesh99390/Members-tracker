@@ -361,23 +361,27 @@ class ExpiryScheduler:
 
     # -------------------------------------------------------- maintenance
     async def maintenance(self) -> None:
-        """Daily: prune old logs, optimize DB, backup, send backup to admin chat."""
+        """Daily: prune old logs, optimize DB, gzip backup, send backup to admin chat.
+
+        The snapshot uses SQLite's online backup API (WAL-safe, consistent even
+        while the bot writes) and is stored as ``bot_YYYY-MM-DD.db.gz``.
+        """
         pruned = await self._guard(lambda: self.db.prune_logs(keep_days=90), 0)
         if pruned:
             log.info("Pruned %s old log rows", pruned)
         await self.db.optimize()
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         backup_dir = Path(self.settings.database_path).parent / "backups"
-        dest = backup_dir / f"bot_{stamp}.db"
+        dest = backup_dir / f"bot_{stamp}.db.gz"
         try:
-            await self.db.backup_to(str(dest))
+            await self.db.backup_gzip(str(dest))
         except Exception as exc:  # noqa: BLE001
             log.exception("Backup failed: %s", exc)
             self.metrics.inc("backup_failed")
             return
         self.metrics.inc("backups_total")
-        # keep only the last 7 local backups
-        for old in sorted(backup_dir.glob("bot_*.db"))[:-7]:
+        # keep only the last 7 local backups (plain .db ones from older versions too)
+        for old in sorted(backup_dir.glob("bot_*.db*"))[:-7]:
             old.unlink(missing_ok=True)
         if self.settings.backup_chat_id:
             try:

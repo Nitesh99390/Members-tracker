@@ -37,7 +37,7 @@ Built with Python 3.11+, [aiogram 3](https://docs.aiogram.dev/), SQLite and APSc
 | **Grace period** | Optional per-chat delay (`off · 12h · 1d · 3d` or `/setgrace 36h`) between expiry and removal, so late payers get a buffer. |
 | **Daily digest** | Opt-in per chat: one DM per day (at `DIGEST_HOUR` local time) to the owner/admins listing members expiring within 3 days. |
 | **Renewal requests** | Members tap 🙏 *Request renewal* under a reminder / expiry DM, in `/mystatus`, or send `/renew`. Admins get the usual one-tap prompt (`✅ Extend · default`, quick picks, `⋯ More`, `🚫 Decline`); durations add to the current expiry, declines keep it. One request per chat per 24 h; unanswered requests close after `ASK_TIMEOUT_HOURS`. Toggle per chat in *Advanced* or with `/setrenewals off`. |
-| **Maintenance** | Daily log pruning + SQLite backup (optionally sent to a chat), `/backup` and `/health` for super-admins, rotating log files. |
+| **Maintenance** | Daily log pruning + WAL-safe SQLite backup via the online backup API, gzip-compressed (`.db.gz`, optionally sent to a chat), `/backup` and `/health` for super-admins, rotating log files. |
 | **Protection** | Per-user anti-spam throttling for commands/buttons; unhandled errors are DM'd to super-admins. |
 | **Robust** | Rate-limit aware, retries failed removals with backoff, permission checks, admin-cache refresh, WAL SQLite, schema auto-migration. |
 | **Fast** | In-memory TTL caches for chat settings / admin & whitelist checks, covering SQLite indexes, concurrent (bounded) removals, reminders, prompts and broadcasts, instant callback acks with double-tap de-duplication. |
@@ -87,7 +87,7 @@ pm2 logs member-tracker-bot --nostream
 | `LOG_DIR` | `logs` | Directory for rotating log files |
 | `ASK_ON_JOIN` | `true` | Ask the owner how long each new member may stay (per-chat override in `/panel`) |
 | `ASK_TIMEOUT_HOURS` | `24` | Hours to wait for an answer before keeping the default duration |
-| `BACKUP_CHAT_ID` | – | Optional chat/user ID that receives the daily DB backup |
+| `BACKUP_CHAT_ID` | – | Optional chat/user ID that receives the daily gzip DB backup (`bot_YYYY-MM-DD.db.gz`) |
 | `BACKUP_HOUR_UTC` | `3` | Hour (UTC) for daily maintenance (log pruning + backup) |
 | `NOTIFY_ADMINS_ON_ERROR` | `true` | DM super-admins on unhandled errors |
 | `DIGEST_HOUR` | `9` | Local hour (in `TIMEZONE`) when opted-in chats receive the daily "expiring soon" digest |
@@ -169,7 +169,7 @@ The bot is designed so that an owner almost never types a command:
 | Screen | What you see |
 |--------|--------------|
 | **Home** (`/start`) | `📂 My chats` · `➕ Add to group` · `📖 Help` |
-| **My chats** | One row per chat with live badges: `▸ 👥 VIP Club · 120 · 🔔3` (active members · pending prompts) · 10 chats per page with a `⬅️ Back · 1/4 · Next ➡️` pager that edits the message in place · `🏠 Home` on every page |
+| **My chats** | One row per chat with live badges: `▸ 👥 VIP Club · 120 · 🔔3` (active members · pending prompts) · 6 chats per page with a `⬅️ Back · 1/4 · Next ➡️` pager that edits the message in place · `🏠 Home` on every page |
 | **Dashboard** | `👥 Members` `⏰ Expiring · n` · `🔔 Pending · n` `🔗 Invite links` · `📊 Overview` `📜 Activity` · `⚙️ Settings` `🛠 Tools` |
 | **Members** | Tabs `▸ 🟢 Active 30` `⏰ Expiring 2` `♾ Lifetime 1` `📁 Past 7` · tappable rows · `◀️ 2 / 4 ▶️` pager · `🔍 Search` `➕ Add member` |
 | **Tools** | `➕ Add member` `🔍 Search` · `📣 Broadcast` (with preview + confirm + progress bar) `🛡 VIP list` · `🔄 Sync` `🔁 Run expiry check` · `📥 Export CSV` `🔐 Check permissions` |
@@ -252,7 +252,7 @@ bot/
     metrics.py               # counters / gauges / latency + Prometheus exposition
   utils/
     timeparse.py             # durations & dates parsing
-    keyboards.py             # inline keyboards + bottom reply menu
+    keyboards.py             # inline keyboards only (no bottom reply menu; /start clears any legacy one)
     invites.py               # invite-link usage limits: x5 / once parsing, labels, presets
     ui.py                    # pure presentation helpers: clip, urgency glyphs, compact deltas, progress bar
     permissions.py           # admin checks
@@ -273,7 +273,11 @@ Run tests: `python -m pytest -q`
 * **Dates without time** are treated as end-of-day (23:59) in the configured timezone.
 * Failed removals (e.g. missing rights) are logged and retried after 1 hour; after 5 failures
   the retry backs off to once a day and the owner is notified.
-* Local backups are kept in `data/backups/` (last 7 days).
+* **Backups** are taken with SQLite's *online backup API* (`aiosqlite` `Connection.backup()`), never
+  by copying the file — in WAL mode a raw copy of `bot.db` misses frames still in `bot.db-wal` and
+  can be corrupt. Output is gzip-compressed: daily `data/backups/bot_YYYY-MM-DD.db.gz` (last 7 kept)
+  and `/backup` → `backup_YYYY-MM-DD_HHMM.db.gz`. Restore with `gunzip <file>.db.gz` and point
+  `DATABASE_PATH` at the result.
 
 ## License
 
