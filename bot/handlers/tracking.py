@@ -36,6 +36,9 @@ async def on_bot_membership(
     if chat.type not in TRACKED_TYPES:
         return
     new = event.new_chat_member
+    # SECURITY: ``event.from_user`` is whoever (re-)added the bot — possibly a
+    # plain member. It is recorded for the audit log only and NEVER used to
+    # derive owner/admin rights. Rights come from ``get_chat_administrators``.
     actor = event.from_user
     actor_id = actor.id if actor and not actor.is_bot else None
 
@@ -48,7 +51,10 @@ async def on_bot_membership(
 
     record = await db.upsert_chat(chat.id, chat.title, chat.type, chat.username, actor_id)
     await db.update_chat(chat.id, tracking_enabled=1)
+    # Verified admin list + creator straight from Telegram (sets owner_id only
+    # when a ``creator`` is found; an existing owner is never clobbered).
     admin_ids = await refresh_chat_admins(bot, db, chat.id)
+    record = await db.get_chat(chat.id) or record
     owner_id = await service.get_owner_id(record, refresh=True)
     await db.add_log(chat.id, None, "bot_added", new.status, actor_id)
 
@@ -73,15 +79,26 @@ async def on_bot_membership(
     pending = await db.count_pending(chat.id)
     dm_markup = dashboard_keyboard(record, pending)
 
-    # Notify the admin who added the bot privately (works for channels too):
-    # one DM carrying the summary and the dashboard buttons.
+    # DM the summary + dashboard buttons privately (works for channels too) —
+    # but only to people Telegram confirms are admins: the verified owner, and
+    # the actor *only if* they are in the verified admin list.
+    verified_admins = set(admin_ids)
+    recipients: list[int] = []
+    if actor_id and actor_id in verified_admins:
+        recipients.append(actor_id)
+    if owner_id and owner_id in verified_admins:
+        recipients.append(owner_id)
     notified: set[int] = set()
-    for uid in (actor_id, owner_id):
-        if not uid or uid in notified:
+    for uid in recipients:
+        if uid in notified:
             continue
         await db.set_context(uid, chat.id)
         if await service.dm_user(uid, text, reply_markup=dm_markup):
             notified.add(uid)
+    if actor_id and actor_id not in verified_admins:
+        log.warning(
+            "Bot (re-)added to %s by non-admin %s — no rights granted", chat.id, actor_id
+        )
     if not notified and chat.type != ChatType.CHANNEL:
         # nobody reachable in private → post once in the group with a button to the DM
         me = await bot.me()

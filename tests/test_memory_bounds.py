@@ -102,7 +102,7 @@ async def test_count_and_first_admin_chat(db: Database):
 
     assert await db.count_chats() == 3
     assert await db.count_admin_chats(None) == 3  # super-admin sees all
-    assert await db.count_admin_chats(1) == 3  # added_by
+    assert await db.count_admin_chats(1) == 0  # added_by grants nothing (security)
     assert await db.count_admin_chats(42) == 1
     assert await db.count_admin_chats(77) == 1
     assert await db.count_admin_chats(999) == 0

@@ -46,7 +46,7 @@ from bot.services.membership import MembershipService
 from bot.services.scheduler import ExpiryScheduler
 from bot.utils import keyboards as K
 from bot.utils.invites import MAX_MEMBER_LIMIT, LimitError, limit_label, split_limit
-from bot.utils.permissions import bot_can_restrict, is_admin
+from bot.utils.permissions import bot_can_restrict, is_admin, verify_admin_live
 from bot.utils.telegram import is_not_modified, tg_call
 from bot.utils.timeparse import (
     ParseError,
@@ -117,13 +117,20 @@ async def _show(call: CallbackQuery, screen: S.Screen) -> None:
 
 
 async def _authorised(
-    call: CallbackQuery, bot: Bot, db: Database, settings: Settings, chat_id: int
+    call: CallbackQuery, bot: Bot, db: Database, settings: Settings, chat_id: int, *, live: bool = False
 ) -> Chat | None:
+    """Load ``chat_id`` and make sure the caller may manage it.
+
+    ``live=True`` bypasses the admin cache and asks Telegram directly — used
+    for the dashboard entry point and anything that hands out access (invite
+    links), so a stale cache can never grant rights.
+    """
     chat = await db.get_chat(chat_id)
     if not chat:
         await call.answer("This chat is no longer tracked.", show_alert=True)
         return None
-    if not await is_admin(bot, db, settings, chat_id, call.from_user.id):
+    check = verify_admin_live if live else is_admin
+    if not await check(bot, db, settings, chat_id, call.from_user.id):
         await call.answer("⛔ Admins only", show_alert=True)
         return None
     return chat
@@ -279,7 +286,8 @@ async def cb_chats(call: CallbackQuery, db: Database, settings: Settings, state:
 @router.callback_query(F.data.startswith("dash:"))
 async def cb_dashboard(call: CallbackQuery, bot: Bot, db: Database, settings: Settings, state: FSMContext) -> None:
     chat_id = int(_ids(call.data, 1)[0])
-    chat = await _authorised(call, bot, db, settings, chat_id)
+    # dashboard entry: verify with Telegram, not just the cache
+    chat = await _authorised(call, bot, db, settings, chat_id, live=True)
     if not chat:
         return
     await state.clear()
@@ -957,7 +965,8 @@ async def cb_invite_new_limited(
     """``inewl:<cid>:<duration>:<limit>`` — create the link (``0`` = unlimited)."""
     chat_id_s, value, limit_s = _ids(call.data, 3)
     chat_id = int(chat_id_s)
-    chat = await _authorised(call, bot, db, settings, chat_id)
+    # invite links grant access -> live Telegram admin check
+    chat = await _authorised(call, bot, db, settings, chat_id, live=True)
     if not chat:
         return
     member_limit = int(limit_s) or None
@@ -1513,6 +1522,10 @@ async def on_invite_custom_text(
     except LimitError as exc:
         await message.reply(f"⚠️ {escape(str(exc))}\nTry again (e.g. <code>3m x5 Gold plan</code>) or /cancel.")
         return
+    if not await verify_admin_live(bot, db, settings, chat.chat_id, message.from_user.id):
+        await state.clear()
+        await message.reply("⛔ Only current admins of this chat can create invite links.")
+        return
     url, msg = await service.create_invite_link(chat, duration, name, message.from_user.id, member_limit=member_limit)
     if not url:
         await message.reply(f"⚠️ {escape(msg)}\nTry again (e.g. <code>3m Gold plan</code>) or /cancel.")
@@ -1545,6 +1558,10 @@ async def on_invite_limit_text(
         return
     member_limit = int(raw)
     name = parts[1].strip() if len(parts) > 1 else None
+    if not await verify_admin_live(bot, db, settings, chat.chat_id, message.from_user.id):
+        await state.clear()
+        await message.reply("⛔ Only current admins of this chat can create invite links.")
+        return
     url, msg = await service.create_invite_link(chat, duration, name, message.from_user.id, member_limit=member_limit)
     if not url:
         await message.reply(f"⚠️ {escape(msg)}\nTry again or /cancel.")

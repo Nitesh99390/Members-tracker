@@ -677,6 +677,14 @@ class Database:
         username: str | None,
         added_by: int | None = None,
     ) -> Chat:
+        """Insert or refresh a chat row.
+
+        ``added_by`` is **audit data only** (who triggered the first insert); it
+        is never updated once set and never grants management rights.
+        ``owner_id`` is deliberately *not* touched here — it is written only by
+        :meth:`set_chat_owner` after the creator was verified via
+        ``get_chat_administrators``.
+        """
         now = to_iso(utcnow())
         await self._exec(
             """
@@ -695,6 +703,22 @@ class Database:
         chat = await self.get_chat(chat_id)
         assert chat is not None
         return chat
+
+    async def set_chat_owner(self, chat_id: int, owner_id: int | None, *, verified_creator: bool = False) -> bool:
+        """Persist ``owner_id`` for ``chat_id`` — only when verified as the Telegram *creator*.
+
+        Returns ``True`` when the row was updated. An existing ``owner_id`` is
+        never overwritten unless ``verified_creator`` is set (i.e. the caller
+        obtained the id from ``get_chat_administrators`` with status
+        ``creator``). Unverified callers may not even seed an empty owner.
+        """
+        if not verified_creator or owner_id is None:
+            return False
+        chat = await self.get_chat(chat_id)
+        if chat is None or chat.owner_id == owner_id:
+            return False
+        await self.update_chat(chat_id, owner_id=int(owner_id))
+        return True
 
     async def get_chat(self, chat_id: int) -> Chat | None:
         cached = self._chat_cache.get(chat_id, _MISSING)
@@ -742,14 +766,17 @@ class Database:
         return await self._count(sql)
 
     # -- chat picker (SQL-level paging; never loads the whole chats table) --
+    # Only *verified* Telegram admins see a chat: ``chat_admins`` is filled
+    # exclusively from ``get_chat_administrators`` and ``owner_id`` only from a
+    # verified ``creator``. ``added_by`` (whoever added the bot) grants nothing.
     _ADMIN_CHATS_WHERE = (
-        "(c.added_by=? OR c.owner_id=? OR c.chat_id IN (SELECT chat_id FROM chat_admins WHERE user_id=?))"
+        "(c.owner_id=? OR c.chat_id IN (SELECT chat_id FROM chat_admins WHERE user_id=?))"
     )
 
     def _picker_where(self, user_id: int | None) -> tuple[str, list[Any]]:
         if user_id is None:  # super-admin: everything
             return "1=1", []
-        return self._ADMIN_CHATS_WHERE, [user_id, user_id, user_id]
+        return self._ADMIN_CHATS_WHERE, [user_id, user_id]
 
     async def count_admin_chats(self, user_id: int | None) -> int:
         """How many chats ``user_id`` may manage (``None`` = super-admin → all)."""
@@ -1178,12 +1205,10 @@ class Database:
         return self._admin_cache.set(key, row is not None)
 
     async def chats_for_admin(self, user_id: int) -> list[Chat]:
+        """Chats where ``user_id`` is a verified Telegram creator/administrator."""
+        where, args = self._picker_where(user_id)
         rows = await self._fetchall(
-            """SELECT c.* FROM chats c
-               WHERE c.added_by=? OR c.owner_id=?
-                  OR c.chat_id IN (SELECT chat_id FROM chat_admins WHERE user_id=?)
-               ORDER BY c.created_at""",
-            (user_id, user_id, user_id),
+            f"SELECT c.* FROM chats c WHERE {where} ORDER BY c.created_at", args
         )
         return [Chat.from_row(r) for r in rows]
 

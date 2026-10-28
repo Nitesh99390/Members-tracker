@@ -135,21 +135,27 @@ class MembershipService:
         return await self.safe_send(user_id, text, reply_markup=reply_markup) is not None
 
     async def get_owner_id(self, chat: Chat, refresh: bool = False) -> int | None:
-        """Return the creator of the chat, caching it in the DB."""
+        """Return the *verified* creator of the chat, caching it in the DB.
+
+        The owner is only ever taken from ``get_chat_administrators`` (status
+        ``creator``). ``chat.added_by`` is never used as a fallback: whoever
+        added the bot may be a plain member and must not receive owner DMs or
+        rights.
+        """
         if chat.owner_id and not refresh:
             return chat.owner_id
         try:
             admins = await tg_call(self.bot.get_chat_administrators, chat.chat_id, retries=2, label="get_admins")
         except (TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter, TelegramUnavailable) as exc:
             log.warning("Cannot fetch admins for %s: %s", chat.chat_id, exc)
-            return chat.owner_id or chat.added_by
+            return chat.owner_id
         for adm in admins:
-            if adm.status == ChatMemberStatus.CREATOR:
+            if adm.status == ChatMemberStatus.CREATOR and not adm.user.is_bot:
                 if adm.user.id != chat.owner_id:
-                    await self.db.update_chat(chat.chat_id, owner_id=adm.user.id)
+                    await self.db.set_chat_owner(chat.chat_id, adm.user.id, verified_creator=True)
                     chat.owner_id = adm.user.id
                 return adm.user.id
-        return chat.owner_id or chat.added_by
+        return chat.owner_id
 
     async def prompt_recipients(self, chat: Chat) -> list[int]:
         """Who should be asked about a new member: owner or all human admins."""
@@ -159,8 +165,9 @@ class MembershipService:
             recipients.extend(await self.db.list_chat_admins(chat.chat_id))
         if owner:
             recipients.append(owner)
-        if not recipients and chat.added_by:
-            recipients.append(chat.added_by)
+        if not recipients:
+            # no verified owner known yet -> fall back to the verified admin list
+            recipients.extend(await self.db.list_chat_admins(chat.chat_id))
         # dedupe, keep order
         seen: set[int] = set()
         ordered = []

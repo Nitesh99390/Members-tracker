@@ -57,6 +57,9 @@ async def test_whitelist_and_context(db: Database):
 
     await db.set_context(5, -200)
     assert await db.get_context(5) == -200
+    # added_by alone grants nothing; only verified Telegram admins/owner see the chat
+    assert await db.chats_for_admin(5) == []
+    await db.set_chat_admins(-200, [5])
     chats = await db.chats_for_admin(5)
     assert [c.chat_id for c in chats] == [-200]
 
