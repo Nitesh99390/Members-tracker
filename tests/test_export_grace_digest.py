@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import io
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
@@ -253,3 +254,29 @@ async def test_digest_job_is_registered_at_configured_hour():
         assert str(job.trigger.timezone) == str(settings.tz)
     finally:
         scheduler.scheduler.shutdown(wait=False)
+
+
+# ---------------------------------------------------------------- maintenance
+@pytest.mark.asyncio
+async def test_maintenance_writes_gzip_backup_and_rotates(env, tmp_path):
+    db, bot, service, scheduler, _ = env
+    bot.send_document = AsyncMock()
+    scheduler.settings = replace(scheduler.settings, backup_chat_id=42, database_path=str(tmp_path / "d.db"))
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    # 8 stale backups (older names sort first) incl. a legacy uncompressed one
+    for i in range(1, 9):
+        (backup_dir / f"bot_2020-01-0{i}.db{'' if i == 1 else '.gz'}").write_bytes(b"x")
+
+    await db.upsert_chat(-900, "G", "supergroup", None)
+    await scheduler.maintenance()
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    dest = backup_dir / f"bot_{today}.db.gz"
+    assert dest.exists() and dest.read_bytes()[:2] == b"\x1f\x8b"
+    assert not list(backup_dir.glob("bot_*.db")) and not list(backup_dir.glob("*.tmp"))
+    assert len(list(backup_dir.glob("bot_*.db.gz"))) == 7  # rotation keeps the newest 7
+    assert scheduler.metrics.snapshot()["counters"]["backups_total"] == 1
+    bot.send_document.assert_awaited_once()
+    args, kwargs = bot.send_document.call_args
+    assert args[0] == 42 and args[1].path == str(dest) and "Daily backup" in kwargs["caption"]

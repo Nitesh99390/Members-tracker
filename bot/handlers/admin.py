@@ -992,15 +992,17 @@ def parse_grace(raw: str) -> int:
 
 @router.message(Command("backup"))
 async def cmd_backup(message: Message, db: Database, settings: Settings) -> None:
-    """Super-admins: receive a copy of the database file."""
+    """Super-admins: receive a gzip-compressed, WAL-safe snapshot of the database."""
     if message.from_user.id not in settings.super_admins:
         return
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
-    dest = Path(settings.database_path).with_name(f"backup_{stamp}.db")
-    await db.backup_to(str(dest))
+    dest = Path(settings.database_path).with_name(f"backup_{stamp}.db.gz")
+    await db.backup_gzip(str(dest))  # online backup API + gzip, never a raw file copy
     try:
         await message.answer_document(
-            FSInputFile(str(dest)), caption=f"🗄 Database backup {stamp} UTC ({dest.stat().st_size // 1024} KB)"
+            FSInputFile(str(dest)),
+            caption=f"🗄 Database backup {stamp} UTC ({dest.stat().st_size // 1024} KB, gzip)\n"
+            f"Restore: <code>gunzip {dest.name}</code>",
         )
     finally:
         dest.unlink(missing_ok=True)

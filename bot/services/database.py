@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import logging
 import shutil
 from collections.abc import AsyncIterator, Iterable
@@ -218,6 +219,12 @@ def from_iso(value: str | None) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _gzip_file(src: Path, dest: Path, chunk: int = 1 << 20) -> None:
+    """Stream-compress ``src`` into ``dest`` (gzip level 6) without loading it in RAM."""
+    with open(src, "rb") as fin, gzip.open(dest, "wb", compresslevel=6) as fout:
+        shutil.copyfileobj(fin, fout, chunk)
 
 
 def _row_get(row: aiosqlite.Row, key: str, default: Any = None) -> Any:
@@ -634,6 +641,25 @@ class Database:
                 await self.conn.backup(target, pages=256)
                 await target.commit()
         return dest
+
+    async def backup_gzip(self, dest: str) -> str:
+        """Online backup compressed with gzip; ``dest`` should end in ``.db.gz``.
+
+        The snapshot is first taken with :meth:`backup_to` (online backup API,
+        WAL-safe) into a sibling ``.db`` temp file, then gzip-streamed in 1 MiB
+        chunks off the event loop and the temp file is removed. Restore with
+        ``gunzip bot_YYYY-MM-DD.db.gz``.
+        """
+        target = Path(dest)
+        if not target.name.endswith(".db.gz"):
+            target = target.with_name(f"{target.name}.gz") if target.suffix == ".db" else target.with_suffix(".db.gz")
+        raw = target.with_name(target.name[: -len(".gz")] + ".tmp")
+        await self.backup_to(str(raw))
+        try:
+            await asyncio.to_thread(_gzip_file, raw, target)
+        finally:
+            raw.unlink(missing_ok=True)
+        return str(target)
 
     async def healthcheck(self) -> bool:
         try:
