@@ -15,6 +15,7 @@ Built with Python 3.11+, [aiogram 3](https://docs.aiogram.dev/), SQLite and APSc
 |------|---------|
 | **Automatic tracking** | Detects joins/leaves in groups, supergroups and channels (via `chat_member` updates). Members present before the bot was added are picked up as soon as they post. |
 | **Ask-on-join prompt** | When someone joins, the bot DMs the **owner** (or all admins) a compact prompt: *Keep default*, three quick picks, *More options* (all presets + custom date) and *Remove*. Unanswered prompts fall back to the default duration after `ASK_TIMEOUT_HOURS`. |
+| **Ask on join request** | When a subscriber sends a **join request** (invite link with *Approve new members*), the owner gets a DM: *"How long may they stay in the group?"* with `✅ Approve · default`, quick picks, `⋯ More` (all presets + custom date) and `🚫 Reject`. The user is only approved after a duration is picked. Unanswered requests are **never** auto-approved — they stay unapproved after `ASK_TIMEOUT_HOURS`. Whitelisted users get lifetime access instantly; a repeated request replaces the old prompt. On by default (`JOIN_REQUESTS=ask`), switchable per chat in *Advanced*. |
 | **Invite links with preset duration** | `/invite 3m VIP` creates a Telegram invite link; anyone joining through it gets 3 months automatically – no prompt needed. |
 | **Invite usage limits** | Cap how many people may use a link: `/invite 1y once Founder` (single-use), `/invite 1m x10 Promo`, or pick **1 · 5 · 10 · 25 · 50 · 100 · custom** in the button flow. Telegram enforces the cap (`member_limit`); the bot mirrors it as `12/50 uses`, marks the link 🎟 *used up* on the last join and posts a note to the log channel. |
 | **Auto-remove on expiry** | Background scheduler removes expired members every 60 s (configurable). **Kick mode** (user can rejoin) or **Ban mode** (permanent). |
@@ -87,6 +88,7 @@ pm2 logs member-tracker-bot --nostream
 | `LOG_DIR` | `logs` | Directory for rotating log files |
 | `ASK_ON_JOIN` | `true` | Ask the owner how long each new member may stay (per-chat override in `/panel`) |
 | `ASK_TIMEOUT_HOURS` | `24` | Hours to wait for an answer before keeping the default duration |
+| `JOIN_REQUESTS` | `ask` | Default for join requests: `ask` (DM owner "how long?" before approving) · `auto` (approve with default duration) · `ignore`. Existing chats on *ignore* are switched to this once on upgrade |
 | `BACKUP_CHAT_ID` | – | Optional chat/user ID that receives the daily gzip DB backup (`bot_YYYY-MM-DD.db.gz`) |
 | `BACKUP_HOUR_UTC` | `3` | Hour (UTC) for daily maintenance (log pruning + backup) |
 | `NOTIFY_ADMINS_ON_ERROR` | `true` | DM super-admins on unhandled errors |

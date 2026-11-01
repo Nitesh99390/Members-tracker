@@ -168,7 +168,9 @@ def settings_screen(chat: Chat, settings: Settings) -> Screen:
 
 
 def advanced_screen(chat: Chat) -> Screen:
-    approve = {0: "ignored", 1: "auto-approved", 2: "you are asked"}.get(chat.approve_requests, "ignored")
+    approve = {0: "ignored", 1: "auto-approved", 2: "you are asked how long they may stay"}.get(
+        chat.approve_requests, "ignored"
+    )
     welcome = "custom text" if chat.welcome_text else "default text"
     log = f"<code>{chat.log_chat_id}</code>" if chat.log_chat_id else "off"
     grace = (

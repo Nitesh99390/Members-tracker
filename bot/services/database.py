@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS chats (
     log_chat_id        INTEGER,                        -- where to post logs
     welcome_enabled    INTEGER NOT NULL DEFAULT 0,
     welcome_text       TEXT,
-    approve_requests   INTEGER NOT NULL DEFAULT 0,     -- auto approve join requests
+    approve_requests   INTEGER NOT NULL DEFAULT 2,     -- 0 ignore · 1 auto · 2 ask owner
     added_by           INTEGER,
     created_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL
@@ -464,8 +464,14 @@ class Database:
 
     CACHE_TTL = 120.0
 
-    def __init__(self, path: str, cache_ttl: float | None = None) -> None:
+    #: kv flag: legacy chats were switched from "ignore" to the configured request mode
+    REQUEST_MODE_MIGRATION_KEY = "migration:approve_requests_ask"
+
+    def __init__(
+        self, path: str, cache_ttl: float | None = None, approve_requests_default: int = 2
+    ) -> None:
         self.path = path
+        self.approve_requests_default = approve_requests_default if approve_requests_default in (0, 1, 2) else 2
         self._conn: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
         ttl = self.CACHE_TTL if cache_ttl is None else cache_ttl
@@ -537,6 +543,22 @@ class Database:
                 await self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         for stmt in MIGRATION_INDEXES:
             await self.conn.execute(stmt)
+        # One-time switch: older releases defaulted join requests to "ignore" (0).
+        # Every subscriber request must now ask the owner how long they may stay.
+        async with self.conn.execute(
+            "SELECT value FROM kv WHERE key=?", (self.REQUEST_MODE_MIGRATION_KEY,)
+        ) as cur:
+            done = await cur.fetchone()
+        if not done:
+            if self.approve_requests_default:
+                await self.conn.execute(
+                    "UPDATE chats SET approve_requests=? WHERE approve_requests=0",
+                    (self.approve_requests_default,),
+                )
+                log.info("Migrating: join requests now default to mode %s", self.approve_requests_default)
+            await self.conn.execute(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES (?, '1')", (self.REQUEST_MODE_MIGRATION_KEY,)
+            )
         await self.conn.commit()
 
     async def index_columns(self, table: str) -> dict[str, list[str]]:
@@ -688,8 +710,9 @@ class Database:
         now = to_iso(utcnow())
         await self._exec(
             """
-            INSERT INTO chats (chat_id, title, chat_type, username, added_by, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO chats (chat_id, title, chat_type, username, added_by, approve_requests,
+                               created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chat_id) DO UPDATE SET
                 title=COALESCE(excluded.title, chats.title),
                 chat_type=COALESCE(excluded.chat_type, chats.chat_type),
@@ -697,7 +720,7 @@ class Database:
                 added_by=COALESCE(chats.added_by, excluded.added_by),
                 updated_at=excluded.updated_at
             """,
-            (chat_id, title, chat_type, username, added_by, now, now),
+            (chat_id, title, chat_type, username, added_by, self.approve_requests_default, now, now),
         )
         self._forget_chat(chat_id)
         chat = await self.get_chat(chat_id)
