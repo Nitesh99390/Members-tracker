@@ -194,7 +194,11 @@ async def run() -> None:
     metrics = Metrics()
     boot = time.perf_counter()
 
-    db = Database(settings.database_path, cache_ttl=settings.cache_ttl)
+    db = Database(
+        settings.database_path,
+        cache_ttl=settings.cache_ttl,
+        approve_requests_default=settings.approve_requests_default,
+    )
     await db.connect()
 
     session = AiohttpSession(timeout=60)

@@ -377,7 +377,7 @@ async def cb_toggle(
         note = "Prompts go to all admins" if updates["ask_target"] == "admins" else "Prompts go to the owner"
     elif key == "approve":
         updates["approve_requests"] = (chat.approve_requests + 1) % 3
-        note = {0: "Join requests ignored", 1: "Join requests auto-approved", 2: "You'll be asked on each request"}[
+        note = {0: "Join requests ignored", 1: "Join requests auto-approved", 2: "You'll be asked how long on each request"}[
             updates["approve_requests"]
         ]
     elif key == "grace":

@@ -59,6 +59,14 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on", "y"}
 
 
+REQUEST_MODES = {"ignore": 0, "off": 0, "0": 0, "auto": 1, "approve": 1, "1": 1, "ask": 2, "2": 2}
+
+
+def _parse_request_mode(raw: str | None) -> int:
+    """``JOIN_REQUESTS`` env → 0 ignore · 1 auto-approve · 2 ask the owner (default)."""
+    return REQUEST_MODES.get((raw or "").strip().lower(), 2)
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -95,6 +103,8 @@ class Settings:
     # --- join prompt ---------------------------------------------------------
     ask_on_join_default: bool = True
     ask_timeout_hours: int = 24
+    # join requests: 0 = ignore, 1 = auto-approve, 2 = ask owner how long (default)
+    approve_requests_default: int = 2
     # --- maintenance ---------------------------------------------------------
     backup_chat_id: int | None = None
     backup_hour_utc: int = 3
@@ -195,6 +205,7 @@ class Settings:
             log_dir=log_dir,
             ask_on_join_default=_env_bool("ASK_ON_JOIN", True),
             ask_timeout_hours=_env_int("ASK_TIMEOUT_HOURS", 24, minimum=1, maximum=24 * 30),
+            approve_requests_default=_parse_request_mode(os.getenv("JOIN_REQUESTS", "ask")),
             backup_chat_id=_env_optional_int("BACKUP_CHAT_ID"),
             backup_hour_utc=_env_int("BACKUP_HOUR_UTC", 3, minimum=0, maximum=23),
             notify_admins_on_error=_env_bool("NOTIFY_ADMINS_ON_ERROR", True),

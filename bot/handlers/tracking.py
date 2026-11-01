@@ -14,7 +14,6 @@ from bot.services.database import Database
 from bot.services.membership import MembershipService
 from bot.utils.keyboards import (
     dashboard_keyboard,
-    join_prompt_keyboard,
     open_private_keyboard,
 )
 from bot.utils.permissions import refresh_chat_admins
@@ -197,10 +196,19 @@ async def on_member_promote(
 async def on_join_request(
     event: ChatJoinRequest, bot: Bot, db: Database, service: MembershipService, settings: Settings
 ) -> None:
+    """A subscriber asked to join → ask the owner how long they may stay (default mode)."""
+    if event.chat.type not in TRACKED_TYPES:
+        return
     chat_rec = await db.get_chat(event.chat.id)
-    if not chat_rec or not chat_rec.tracking_enabled or not chat_rec.approve_requests:
+    if chat_rec is None:
+        chat_rec = await db.upsert_chat(
+            event.chat.id, event.chat.title, event.chat.type, event.chat.username
+        )
+    if not chat_rec.tracking_enabled or not chat_rec.approve_requests:
         return
     user = event.from_user
+    if user.is_bot:
+        return
     if chat_rec.approve_requests == 1:
         try:
             await event.approve()
@@ -209,31 +217,8 @@ async def on_join_request(
             log.warning("Cannot approve join request in %s: %s", event.chat.id, exc)
         return
 
-    # mode 2: ask owner/admins to approve with a duration
-    recipients = await service.prompt_recipients(chat_rec)
-    if not recipients:
-        return
-    pending = await db.create_pending(
-        chat_rec.chat_id, user.id, user.full_name, user.username, source="request"
-    )
-    uname = f" · @{escape(user.username)}" if user.username else ""
-    bio = f"\n💬 <i>{escape(event.bio)}</i>" if getattr(event, "bio", None) else ""
-    text = (
-        f"🙋 <b>Join request</b>\n\n"
-        f"👤 {pending.mention_html}{uname}\n🆔 <code>{user.id}</code>{bio}\n"
-        f"📍 {escape(chat_rec.display)}\n\n"
-        f"Approve with a duration, or reject.\n"
-        f"<i>Default: {describe_duration(service.effective_duration(chat_rec))}</i>"
-    )
-    delivered = 0
-    for admin_id in recipients:
-        msg = await service.safe_send(admin_id, text, reply_markup=join_prompt_keyboard(pending.id, service.effective_duration(chat_rec), True))
-        if msg:
-            delivered += 1
-            await db.add_prompt_message(pending.id, admin_id, msg.message_id)
-    if not delivered:
-        await db.resolve_pending(pending.id, None, "undeliverable", status="cancelled")
-    await db.add_log(event.chat.id, user.id, "request_prompt", f"to {delivered} admin(s)")
+    # mode 2 (default): ask owner/admins how long this subscriber may stay
+    await service.ask_about_join_request(chat_rec, user, bio=getattr(event, "bio", None))
 
 
 # Fallback for groups where chat_member updates are not delivered

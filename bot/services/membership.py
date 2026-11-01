@@ -284,6 +284,68 @@ class MembershipService:
         await self.db.add_log(chat.chat_id, member.user_id, "prompt_sent", f"to {delivered} admin(s)")
         return pending
 
+    async def ask_about_join_request(
+        self, chat: Chat, user: User, bio: str | None = None
+    ) -> PendingJoin | None:
+        """DM the owner/admins: *"X wants to join — how long may they stay?"*.
+
+        The request stays unapproved in Telegram until someone picks a duration
+        (approve) or rejects it. Whitelisted users / chat admins are approved
+        straight away with lifetime access.
+        """
+        if await self.db.is_whitelisted(chat.chat_id, user.id) or await self.db.is_chat_admin(
+            chat.chat_id, user.id
+        ):
+            try:
+                await self.bot.approve_chat_join_request(chat.chat_id, user.id)
+            except (TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError) as exc:
+                log.warning("Cannot approve whitelisted request in %s: %s", chat.chat_id, exc)
+                return None
+            await self.db.upsert_member(
+                chat.chat_id, user.id, user.full_name, user.username, None, None, source="request"
+            )
+            await self.db.add_log(chat.chat_id, user.id, "request_approved", "whitelisted")
+            return None
+
+        recipients = await self.prompt_recipients(chat)
+        if not recipients:
+            log.info("Join request in %s but nobody to ask", chat.chat_id)
+            await self.db.add_log(chat.chat_id, user.id, "request_prompt", "no recipients")
+            return None
+        # a repeated request replaces the old prompt (its buttons are retired)
+        old = await self.db.get_pending_for(chat.chat_id, user.id)
+        if old and old.source == "request":
+            if await self.db.resolve_pending(old.id, None, "superseded", status="cancelled"):
+                await self._finalize_prompt(old, chat, None, "↻ Replaced by a newer request.", "")
+        pending = await self.db.create_pending(
+            chat.chat_id, user.id, user.full_name, user.username, source="request"
+        )
+        text = self.request_prompt_text(chat, pending, bio)
+        kb = join_prompt_keyboard(pending.id, self.effective_duration(chat), True)
+        delivered = await self.deliver_prompt(pending.id, recipients, text, kb)
+        if not delivered:
+            # owner never /start-ed the bot: request stays pending in Telegram for manual review
+            await self.db.resolve_pending(pending.id, None, "undeliverable", status="cancelled")
+            await self.db.add_log(chat.chat_id, user.id, "prompt_undeliverable", "request")
+            return None
+        await self.db.add_log(chat.chat_id, user.id, "request_prompt", f"to {delivered} admin(s)")
+        return pending
+
+    def request_prompt_text(self, chat: Chat, pending: PendingJoin, bio: str | None = None) -> str:
+        icon = "📢" if chat.is_channel else "👥"
+        uname = f" · @{escape(pending.username)}" if pending.username else ""
+        about = f"\n💬 <i>{escape(bio)}</i>" if bio else ""
+        return (
+            f"🙋 <b>Join request</b>\n\n"
+            f"👤 {pending.mention_html}{uname}\n"
+            f"🆔 <code>{pending.user_id}</code>{about}\n"
+            f"{icon} {escape(chat.display)}\n\n"
+            f"⏳ <b>How long may they stay in the group?</b>\n"
+            f"Pick a duration to approve, or reject.\n"
+            f"<i>Default: {describe_duration(self.effective_duration(chat))} · "
+            f"no answer within {self.settings.ask_timeout_hours}h = request stays unapproved.</i>"
+        )
+
     async def deliver_prompt(
         self, pending_id: int, recipients: list[int], text: str, kb: InlineKeyboardMarkup
     ) -> int:
@@ -307,6 +369,8 @@ class MembershipService:
     def prompt_text(self, chat: Chat, pending: PendingJoin, member: Member | None) -> str:
         if pending.source == "renewal":
             return self.renewal_prompt_text(chat, pending, member)
+        if pending.source == "request":
+            return self.request_prompt_text(chat, pending)
         return self.join_prompt_text(chat, pending, member)
 
     async def apply_decision(
@@ -671,11 +735,14 @@ class MembershipService:
         return True, outcome
 
     async def _finalize_prompt(
-        self, pending: PendingJoin, chat: Chat, member: Member, outcome: str, actor_name: str
+        self, pending: PendingJoin, chat: Chat, member: Member | None, outcome: str, actor_name: str
     ) -> None:
         """Edit every admin's prompt message to show the decision and drop the buttons."""
         uname = f" (@{escape(pending.username)})" if pending.username else ""
-        title = "🙏 <b>Renewal request</b>" if pending.source == "renewal" else "🔔 <b>Member decision</b>"
+        title = {
+            "renewal": "🙏 <b>Renewal request</b>",
+            "request": "🙋 <b>Join request</b>",
+        }.get(pending.source, "🔔 <b>Member decision</b>")
         text = (
             f"{title}\n\n"
             f"👤 {pending.mention_html}{uname}\n🆔 <code>{pending.user_id}</code>\n"
@@ -711,6 +778,15 @@ class MembershipService:
                 continue
             count += 1
             chat = await self.db.get_chat(pending.chat_id)
+            if chat and pending.source == "request":
+                # never auto-admit: the subscriber waits until an admin decides in Telegram
+                await self._finalize_prompt(
+                    pending, chat, None,
+                    "⏱ No answer — request left unapproved. Approve it from the chat's "
+                    "<i>Join requests</i> list; you'll be asked for a duration on join.",
+                    "",
+                )
+                continue
             member = await self.db.get_member(pending.chat_id, pending.user_id)
             if not (chat and member):
                 continue
