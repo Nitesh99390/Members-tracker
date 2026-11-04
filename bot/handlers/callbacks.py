@@ -798,7 +798,11 @@ async def cb_join_more(call: CallbackQuery, bot: Bot, db: Database, settings: Se
         await call.answer("Already handled.", show_alert=True)
         return
     if call.message:
-        await call.message.edit_reply_markup(reply_markup=K.join_more_keyboard(pid))
+        try:
+            await call.message.edit_reply_markup(reply_markup=K.join_more_keyboard(pid))
+        except TelegramBadRequest as exc:
+            if not is_not_modified(exc):
+                log.debug("join-more edit failed: %s", exc)
     await call.answer()
 
 

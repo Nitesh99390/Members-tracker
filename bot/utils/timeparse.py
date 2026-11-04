@@ -152,10 +152,12 @@ def parse_expiry(text: str, tz: ZoneInfo, now: datetime | None = None) -> dateti
     if is_permanent(text):
         raise ParseError("permanent")
     try:
-        return parse_date(text, tz)
+        result = parse_date(text, tz)
     except ParseError:
-        pass
-    result = apply_duration(now, text)
+        result = apply_duration(now, text)
+    # Absolute dates must be in the future too: a past date (typo, or an
+    # invite-link preset like "2025-01-31" that has since passed) would make the
+    # member expire — and get kicked — on the very next scheduler tick.
     if result <= now:
         raise ParseError("Expiry must be in the future")
     return result

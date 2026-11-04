@@ -837,9 +837,12 @@ async def cmd_revoke(
     if not arg:
         await _usage(message, "/revoke &lt;invite link&gt;")
         return
-    target = next(
-        (lnk for lnk in await db.list_invite_links(chat.chat_id) if lnk.invite_link.endswith(arg.split("/")[-1])),
-        None,
+    suffix = arg.rstrip("/").split("/")[-1].strip()
+    # an empty suffix (e.g. "/revoke https://t.me/") would match *every* link
+    target = (
+        next((lnk for lnk in await db.list_invite_links(chat.chat_id) if lnk.invite_link.endswith(suffix)), None)
+        if len(suffix) >= 4
+        else None
     )
     if not target:
         await message.reply("⚠️ I don't know that link. Use /invites to see the ones I created.")

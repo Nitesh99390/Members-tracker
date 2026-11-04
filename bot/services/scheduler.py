@@ -15,7 +15,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from bot.config import Settings
-from bot.services.database import Chat, Database, Member
+from bot.services.database import Chat, Database, Member, to_iso
 from bot.services.membership import MembershipService
 from bot.services.metrics import Metrics
 from bot.utils.keyboards import renewal_request_keyboard
@@ -29,6 +29,8 @@ MAX_FAILS_BEFORE_BACKOFF = 5
 # how many removals / reminder DMs run at the same time
 REMOVE_CONCURRENCY = 4
 REMIND_CONCURRENCY = 8
+# reminder candidates fetched per keyset page
+REMINDER_PAGE = 500
 # daily digest: look-ahead window and how many names to list per chat
 DIGEST_DAYS = 3
 DIGEST_ROWS = 15
@@ -237,9 +239,6 @@ class ExpiryScheduler:
             return 0
         now = datetime.now(timezone.utc)
         horizon = now + timedelta(hours=max(self.settings.reminder_hours))
-        candidates = await self.db.expiring_members(horizon)
-        if not candidates:
-            return 0
         sem = asyncio.Semaphore(REMIND_CONCURRENCY)
         reminded = 0
 
@@ -280,7 +279,19 @@ class ExpiryScheduler:
             if sent:
                 reminded += 1
 
-        await asyncio.gather(*(remind(m) for m in candidates))
+        # Keyset-paged over *all* candidates of chats that want reminders: a
+        # single ``LIMIT 500`` page used to be filled by chats with tracking or
+        # member DMs off, so everybody else silently missed their reminder.
+        after: tuple[str, int, int] | None = None
+        while True:
+            page = await self.db.reminder_candidates(horizon, now, after=after, limit=REMINDER_PAGE)
+            if not page:
+                break
+            await asyncio.gather(*(remind(m) for m in page))
+            last = page[-1]
+            after = (to_iso(last.expires_at), last.chat_id, last.user_id)
+            if len(page) < REMINDER_PAGE:
+                break
         return reminded
 
     async def refresh_admins(self) -> None:
