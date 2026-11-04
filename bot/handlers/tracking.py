@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from html import escape
 
 from aiogram import Bot, F, Router
@@ -10,7 +11,7 @@ from aiogram.filters import ChatMemberUpdatedFilter, IS_MEMBER, JOIN_TRANSITION,
 from aiogram.types import ChatJoinRequest, ChatMemberUpdated, Message
 
 from bot.config import Settings
-from bot.services.database import Database
+from bot.services.database import INVITE_REVOKED, Database
 from bot.services.membership import MembershipService
 from bot.utils.keyboards import (
     dashboard_keyboard,
@@ -24,6 +25,9 @@ router = Router(name="tracking")
 
 TRACKED_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL}
 GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
+#: Telegram service accounts that appear as ``from_user`` but are not people:
+#: 777000 = linked-channel posts, 1087968824 = GroupAnonymousBot, 136817688 = Channel_Bot.
+SERVICE_USER_IDS = frozenset({777000, 1087968824, 136817688})
 
 
 # ------------------------------------------------------------- bot membership
@@ -127,18 +131,23 @@ async def on_member_join(
         return
 
     existing = await db.get_member(chat_rec.chat_id, user.id)
-    if (
-        getattr(event, "via_join_request", False)
-        and existing
-        and existing.is_active
-        and existing.source == "request"
+    invite = event.invite_link.invite_link if event.invite_link else None
+    if existing and existing.is_active and (
+        existing.expires_at is None or existing.expires_at > datetime.now(timezone.utc)
     ):
-        # already decided by an admin while approving the join request
-        await db.update_member_profile(chat_rec.chat_id, user.id, user.full_name, user.username)
-        return
+        # The membership was already decided before this join event: join request
+        # approved with a duration, renewal approved after removal ("please
+        # rejoin"), manual /add, or a leave we missed while offline. Re-running
+        # track_join would overwrite that expiry with the chat default and prompt
+        # the owner again. Only a known, non-revoked invite link with its own
+        # preset duration takes precedence.
+        link = await db.get_invite_link(invite) if invite else None
+        if link is None or link.state == INVITE_REVOKED:
+            await db.update_member_profile(chat_rec.chat_id, user.id, user.full_name, user.username)
+            await db.add_log(chat_rec.chat_id, user.id, "rejoin_kept", existing.source)
+            return
 
     actor = event.from_user.id if event.from_user and event.from_user.id != user.id else None
-    invite = event.invite_link.invite_link if event.invite_link else None
     member = await service.track_join(chat_rec, user, actor_id=actor, invite_link=invite)
     if member is None:
         return
@@ -153,7 +162,7 @@ async def on_member_join(
                 expires=format_dt(member.expires_at, settings.tz),
                 chat=escape(chat_rec.display),
             )
-        except (KeyError, IndexError, ValueError):
+        except (KeyError, IndexError, ValueError, AttributeError):
             text = f"👋 Welcome {member.mention_html}!"
         await service.safe_send(event.chat.id, text)
 
@@ -258,6 +267,12 @@ async def on_left_chat_member_message(
 async def on_group_message(message: Message, db: Database, service: MembershipService) -> None:
     user = message.from_user
     if user is None or user.is_bot:
+        return
+    # Posts forwarded from a linked channel arrive from the service account
+    # 777000 and anonymous admins / "send as channel" messages carry a
+    # sender_chat: none of these are real members and must never be tracked
+    # (the bot would later try — and keep failing — to kick them).
+    if message.sender_chat is not None or user.id in SERVICE_USER_IDS:
         return
     chat_rec = await db.get_chat(message.chat.id)
     if not chat_rec or not chat_rec.tracking_enabled:

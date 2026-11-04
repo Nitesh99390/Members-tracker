@@ -42,6 +42,14 @@ BULK_BATCH = STREAM_BATCH
 
 log = logging.getLogger(__name__)
 
+#: ``get_chat_member`` error fragments meaning "this user is not in the chat".
+_USER_GONE_MARKERS = ("user not found", "participant_id_invalid", "user_not_participant", "member not found")
+
+
+def _is_user_gone_error(exc: BaseException) -> bool:
+    text = error_text(exc).lower()
+    return any(marker in text for marker in _USER_GONE_MARKERS)
+
 #: Anything ``send_message`` accepts as ``reply_markup`` (inline or bottom keyboard).
 ReplyMarkup = InlineKeyboardMarkup | ReplyKeyboardMarkup | ReplyKeyboardRemove
 
@@ -1083,9 +1091,15 @@ class MembershipService:
                     cm = await tg_call(
                         self.bot.get_chat_member, chat.chat_id, member.user_id, retries=2, label="get_member"
                     )
-                except TelegramBadRequest:
-                    result["gone"] += 1
-                    await self.db.set_member_status(chat.chat_id, member.user_id, "left")
+                except TelegramBadRequest as exc:
+                    # Only a *user*-level error means the member is gone. Chat-level
+                    # errors ("chat not found", "bot is not a member", missing rights)
+                    # used to mark every tracked member as left in one sweep.
+                    if _is_user_gone_error(exc):
+                        result["gone"] += 1
+                        await self.db.set_member_status(chat.chat_id, member.user_id, "left")
+                    else:
+                        result["errors"] += 1
                     return
                 except (TelegramForbiddenError, TelegramRetryAfter, TelegramUnavailable):
                     result["errors"] += 1

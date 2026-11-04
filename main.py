@@ -24,7 +24,12 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramUnauthorizedError
+from aiogram.exceptions import (
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+    TelegramUnauthorizedError,
+)
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
@@ -127,7 +132,7 @@ async def wait_for_telegram(bot: Bot, attempts: int = 8):
             raise RuntimeError("BOT_TOKEN was rejected by Telegram (401). Check your .env.") from None
         except TelegramRetryAfter as exc:
             await asyncio.sleep(min(exc.retry_after, 30))
-        except TelegramNetworkError as exc:
+        except (TelegramNetworkError, TelegramServerError) as exc:
             if attempt == attempts:
                 raise
             log.warning("Telegram unreachable (%s), retry %s/%s in %.0fs", exc, attempt, attempts, delay)

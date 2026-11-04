@@ -1101,13 +1101,53 @@ class Database:
         return await self._count(sql, params)
 
     async def expired_members(self, now: datetime | None = None, limit: int = 200) -> list[Member]:
+        """Active members that are due for removal *now* (oldest first, bounded).
+
+        Only rows the scheduler can actually act on are returned: the chat must
+        exist with tracking enabled and the per-chat grace period must be over.
+        Without these filters members of a paused chat (or still inside their
+        grace window) sit at the head of the ``ORDER BY expires_at`` queue
+        forever and, once there are ``limit`` of them, starve every other chat
+        of removals.
+        """
         now = now or utcnow()
+        now_iso = to_iso(now)
         rows = await self._fetchall(
-            """SELECT * FROM members
-               WHERE status='active' AND expires_at IS NOT NULL AND expires_at <= ?
-               ORDER BY expires_at ASC LIMIT ?""",
-            (to_iso(now), limit),
+            """SELECT m.* FROM members m JOIN chats c ON c.chat_id = m.chat_id
+               WHERE m.status='active' AND m.expires_at IS NOT NULL AND m.expires_at <= ?
+                 AND c.tracking_enabled=1
+                 AND julianday(m.expires_at) + COALESCE(c.grace_hours, 0) / 24.0 <= julianday(?)
+               ORDER BY m.expires_at ASC LIMIT ?""",
+            (now_iso, now_iso, limit),
         )
+        return [Member.from_row(r) for r in rows]
+
+    async def reminder_candidates(
+        self,
+        before: datetime,
+        now: datetime | None = None,
+        after: tuple[str, int, int] | None = None,
+        limit: int = 500,
+    ) -> list[Member]:
+        """Members of chats that want reminders, expiring in ``(now, before]`` (keyset paged).
+
+        ``after`` is the ``(expires_at_iso, chat_id, user_id)`` of the last row
+        of the previous page, so the scheduler can walk *every* candidate
+        instead of only the first ``limit`` (which used to include chats with
+        tracking or member DMs turned off).
+        """
+        now = now or utcnow()
+        sql = """SELECT m.* FROM members m JOIN chats c ON c.chat_id = m.chat_id
+                 WHERE m.status='active' AND m.expires_at IS NOT NULL
+                   AND m.expires_at > ? AND m.expires_at <= ?
+                   AND c.tracking_enabled=1 AND c.notify_user=1"""
+        params: list[Any] = [to_iso(now), to_iso(before)]
+        if after is not None:
+            sql += " AND (m.expires_at, m.chat_id, m.user_id) > (?, ?, ?)"
+            params.extend(after)
+        sql += " ORDER BY m.expires_at, m.chat_id, m.user_id LIMIT ?"
+        params.append(limit)
+        rows = await self._fetchall(sql, params)
         return [Member.from_row(r) for r in rows]
 
     async def expiring_members(self, before: datetime, chat_id: int | None = None) -> list[Member]:

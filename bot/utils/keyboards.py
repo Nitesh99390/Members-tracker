@@ -10,6 +10,7 @@ Design rules (keep the bot feeling clean and professional):
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 from aiogram.types import (
     CopyTextButton,
@@ -552,7 +553,9 @@ def invites_keyboard(chat: Chat, links: list[InviteLink]) -> InlineKeyboardMarku
 def invite_created_keyboard(chat_id: int, url: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(_copy("📋 Copy link", url))
-    kb.row(_url("📤 Share", f"https://t.me/share/url?url={url}"))
+    # Percent-encode the link: private invite links look like ``https://t.me/+AbCd``
+    # and an unescaped ``+`` in a query string decodes to a space (broken link).
+    kb.row(_url("📤 Share", f"https://t.me/share/url?url={quote(url, safe='')}"))
     kb.row(_btn("◀️ Invite links", f"invites:{chat_id}"))
     return kb.as_markup()
 
